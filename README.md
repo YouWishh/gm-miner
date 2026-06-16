@@ -17,43 +17,44 @@ lifecycle from your laptop.
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
 
-## Install
+## Quick start
 
-`gmcli` runs operator-side from a laptop. Prebuilt binaries for macOS (Apple Silicon + Intel)
-and Linux (x86-64 + aarch64) are published on the
-[GitHub Releases page](https://github.com/taostat/gm-miner/releases).
+Three steps to a running miner.
 
-Install the latest release with the one-line installer:
+1. **Install the Phala CLI** (the miner deploys to Phala Cloud) and have a funded account:
 
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/taostat/gm-miner/releases/latest/download/gmcli-installer.sh | sh
-```
+   ```sh
+   npm i -g phala
+   phala auth login          # or set PHALA_API_KEY
+   ```
 
-The installer places the binary in `~/.cargo/bin` (or `CARGO_HOME`) and ensures that directory
-is on your `PATH`. To install a specific version, replace `latest` with a tag, e.g.
-`download/v0.1.0/`.
+   A new miner needs a funded Phala Cloud account — sign up at <https://cloud.phala.network> and
+   create an API key (Dashboard → API Keys).
 
-Verify:
+2. **Install gmcli:**
 
-```sh
-gmcli --version
-```
+   ```sh
+   curl --proto '=https' --tlsv1.2 -LsSf \
+     https://github.com/taostat/gm-miner/releases/latest/download/gmcli-installer.sh | sh
+   ```
 
-## Onboarding walkthrough
+   The installer places the binary in `~/.cargo/bin` (or `CARGO_HOME`) and ensures that
+   directory is on your `PATH`. To install a specific version, replace `latest` with a tag, e.g.
+   `download/v0.1.0/`.
 
-The `gmcli init` wizard walks you through the entire setup in order. Run it first:
+3. **Run the guided onboarding:**
 
-```sh
-gmcli --network testnet init   # start on testnet (netuid 482)
-gmcli init                     # or mainnet (netuid 28, the default)
-```
+   ```sh
+   gmcli --network testnet init   # testnet (netuid 482)
+   gmcli init                     # mainnet (netuid 28, default)
+   ```
 
-The wizard detects steps already done (hotkey recorded, login valid, worker deployed, keys set)
-and skips them, so a returning miner breezes through. Each step shows the exact command it will
-run and asks before executing. Run `gmcli --yes init` to accept every step without prompting.
+   `gmcli init` walks you through hotkey → login → deploy → provider keys, detecting and
+   skipping anything already done. That's it.
 
-You can also run each step individually:
+## Manual setup (advanced)
+
+Prefer to run each step yourself? `gmcli init` just orchestrates these:
 
 ### 1. Register your hotkey
 
