@@ -1,0 +1,39 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# Only the shell installer ships. Windows is unsupported: gmcli talks to Phala
+# dstack TEEs over Unix domain sockets (http-client-unix-domain-socket →
+# tokio::net::UnixStream), which does not exist on Windows, so the msvc target
+# cannot compile. The powershell installer is dropped with it. Homebrew is
+# deferred to go-public (tap repo doesn't exist yet); re-add "homebrew" + its
+# publish-job when the repo flips public and the tap is created.
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax). Unix only —
+# see the Windows note above.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# Homebrew tap target, reinstated at go-public alongside the "homebrew"
+# installer and a ["homebrew"] publish-jobs entry. The tap repo
+# (taostat/homebrew-gmcli) does not exist yet, so neither is active for the
+# private v0.1.0 cut.
+tap = "taostat/homebrew-gmcli"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# The generated .github/workflows/release.yml is hand-edited after
+# generation to SHA-pin all GitHub Actions (repo security convention,
+# enforced by zizmor/actionlint in ci.yml). Tell dist not to treat that
+# file as out-of-date. After any `dist init`/`dist generate`, re-pin the
+# `uses:` lines per the note at the top of release.yml.
+allow-dirty = ["ci"]

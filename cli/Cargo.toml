@@ -1,0 +1,75 @@
+[package]
+# The package is named after the binary it ships (`gmcli`) so that
+# cargo-dist names every artifact, installer, and Homebrew formula
+# `gmcli-*` rather than after the crate. The library target keeps its
+# own `gm_miner_cli` name (see [lib] below) and the OAuth client_id
+# remains `gm-miner-cli`, so neither imports nor auth are affected.
+name = "gmcli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage = "https://github.com/taostat/gm-miner"
+description = "gm miner CLI — login, deploy, doctor, declare-product(s), status, worker management."
+
+[lints.clippy]
+# Inherit all workspace lints, then relax the ones that don't apply to a CLI.
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+dbg_macro = "deny"
+todo = "deny"
+# CLIs print to stdout/stderr by design — relax these workspace-level denies.
+print_stdout = "allow"
+print_stderr = "allow"
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
+similar_names = "allow"
+too_many_arguments = "allow"
+
+# The workspace sets `publish = false` (this CLI is never published to
+# crates.io). That flag also hides the crate from `dist`, so opt the binary
+# back in explicitly for release builds.
+[package.metadata.dist]
+dist = true
+
+[[bin]]
+name = "gmcli"
+path = "src/main.rs"
+
+[lib]
+name = "gm_miner_cli"
+path = "src/lib.rs"
+
+[dependencies]
+clap         = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+sha2         = { workspace = true }
+hex          = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+reqwest      = { workspace = true }
+chrono       = { version = "0.4", features = ["serde"] }
+dirs         = "6"
+open         = "5"
+base64       = "0.22"
+fd-lock      = "4"
+
+[dev-dependencies]
+wiremock     = "0.6"
+tokio        = { workspace = true }
+tempfile     = "3"
+chrono       = { version = "0.4", features = ["serde"] }

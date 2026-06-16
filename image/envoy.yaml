@@ -1,0 +1,803 @@
+## gm miner Envoy configuration — three provider routes plus an
+## optional benchmark route.
+##
+## Routes match on the `x-gm-provider` header set by the gateway and
+## are gated on the upstream key being present in the container's
+## environment. Unconfigured providers return 401 from upstream when
+## probed (envoy substitutes an empty key) so the registry can detect
+## "no key set" the same way it detects "key revoked".
+##
+## The benchmark route (`x-gm-provider: benchmark`) proxies to a
+## synthetic benchmark upstream. The upstream URL is hardcoded per
+## network in `start.sh` and keyed off GM_NETWORK (rendered into the
+## compose by `gmcli deploy`); `start.sh` substitutes the host/port
+## into this config's `__GM_BENCHMARK_HOST__` / `__GM_BENCHMARK_PORT__`
+## placeholders at container start, and keeps or drops the
+## `gm:benchmark-tls` sentinel block on the benchmark cluster depending
+## on the URL's scheme (kept for https, dropped for http). Because
+## both URLs live in the image source, the route cannot be redirected
+## at runtime — only by editing start.sh, which moves the compose_hash
+## and is rejected by the registry's attestation enforcement.
+##
+## Inbound auth (Mechanism 1 of attestation-and-identity.md): a Lua
+## filter checks the `x-gm-node-key` header against the node secret
+## before any route runs. `start.sh` renders the secret into this
+## config from the `GM_NODE_SECRET` env var at container start (see the
+## filter's own comment). Requests without the correct secret are
+## rejected with 401. When `GM_NODE_SECRET` is unset the check is
+## skipped (a miner predating node-secret auth) — the data plane is
+## then open, the pre-Mechanism-1 behaviour. The gateway and the
+## registry's control-loop probes both set this header.
+##
+## Header handling per spec §10.4:
+##   - Strip gm-internal headers (x-gm-request-id, x-gm-gateway-sig,
+##     x-gm-product, x-gm-node-key) before forwarding upstream.
+##   - Replace Authorization with the upstream key from env.
+##
+## Prometheus metrics: the `metrics` listener on :9902 below surfaces
+## `/stats/prometheus` (and only that path) to external scrapers, gated
+## on `x-gm-node-key`. The full admin interface stays loopback-only.
+## See that listener's own comment for the rationale. This replaces the
+## deleted capability sidecar's `/metrics` endpoint.
+##
+## Load shedding: under saturation the data plane sheds load with an
+## HTTP 429 rather than by resetting connections. The HTTP local
+## rate-limit filter returns 429 when inbound request rate outruns its
+## token bucket — the observable saturation signal the gateway router
+## and registry admission loop key off. `/attestation/info` is exempt
+## so the registry can always reach the attestation surface. Separately,
+## the `overload_manager` caps total downstream connections as a
+## file-descriptor-exhaustion backstop: it is sized so the rate-limit
+## filter always sheds first, and it rejects at the connection-accept
+## layer (no status code) only in a pathological flood.
+##
+## RA-TLS data plane (Mechanism 2 of attestation-and-identity.md): the
+## `:8080` ingress listener terminates TLS with a certificate minted by
+## dstack's native RA-TLS facility. At container start `start.sh` runs
+## `gm-miner-ratls`, which calls the dstack guest agent's `GetTlsKey`
+## RPC with `usage_ra_tls: true`; the guest agent generates a fresh
+## P-256 key, takes a TDX quote whose `report_data` commits to that key
+## (`SHA-512("ratls-cert:" || pubkey_der)`), and issues an X.509 leaf
+## carrying the quote in extension OID `1.3.6.1.4.1.62397.1.8`. The key
+## and cert PEM files land at `/tmp/gm-ratls/` and are referenced by the
+## listener's `DownstreamTlsContext` below. The gateway verifies the
+## embedded quote once per connection; every request on that connection
+## then inherits the attestation guarantee.
+##
+## Callers reach this listener through the dstack gateway's
+## TLS-passthrough URL (`https://<app-id>-8080s.<node>.phala.network`):
+## passthrough means the dstack gateway forwards the raw TLS stream so
+## the RA-TLS certificate Envoy serves is the one the caller receives.
+## The default `-8080` URL would have the dstack gateway terminate TLS
+## at its edge and hide this cert — `gmcli deploy` registers the
+## `-8080s` form for that reason.
+##
+## `/attestation/info` stays reachable over this same TLS listener — the
+## registry's control loop and auditors connect over TLS and probe that
+## path. The RA-TLS cert is self-signed (trust comes from the embedded
+## quote, not from a CA chain or a hostname match), so a plain `curl`
+## needs `-k`; a verifying client checks the quote instead of the chain.
+
+admin:
+  ## Bound to loopback only. The container exposes 9901 as informational
+  ## but a scrape endpoint accessible only from inside the TEE keeps
+  ## the attack surface minimal — the registry probes `:8080` (the
+  ## data plane) with `x-gm-provider` for liveness/capability checks
+  ## instead.
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+
+## ── File-descriptor exhaustion backstop ─────────────────────────────
+##  The data plane's saturation signal is the HTTP local rate-limit
+##  filter further down — a clean 429 the gateway router and the
+##  registry admission loop key off. That filter is what sheds load
+##  gracefully and observably.
+##
+##  This overload manager is a separate, lower-level guard with one job:
+##  cap the number of simultaneously open downstream connections so a
+##  connection flood can never exhaust the container's file descriptors.
+##  Envoy is a proxy — every downstream connection plus its upstream
+##  connection consumes fds — and fd starvation is the failure the
+##  admission benchmark traced: once Envoy can no longer open sockets it
+##  sheds load by resetting connections, with no status code at all.
+##
+##  The `downstream_connections` monitor enforces `max_active_downstream
+##  _connections` directly at the connection-accept layer: past the cap,
+##  new TCP connections are refused before they are accepted. A refused
+##  connection cannot be sent an HTTP response — that is inherent to
+##  rejecting at accept time — so this layer does NOT produce a graceful
+##  status code. It is deliberately sized as a backstop that effectively
+##  never fires: the rate-limit filter sheds load with a 429 long before
+##  connection count could approach this ceiling. Its value is bounding
+##  the worst case (a pathological flood) so the miner fails predictably
+##  at a known limit instead of unpredictably at fd exhaustion.
+##
+##  8192 is the ceiling: the container's fd soft limit is 65536 (see
+##  dstack/docker-compose.yaml) and Envoy's sizing guidance puts the
+##  connection limit below half the fd limit, leaving a wide margin for
+##  upstream connections and Envoy's own descriptors.
+overload_manager:
+  resource_monitors:
+    - name: "envoy.resource_monitors.global_downstream_max_connections"
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+        max_active_downstream_connections: 8192
+
+static_resources:
+
+  listeners:
+    - name: ingress
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8080
+      filter_chains:
+        - ## ── RA-TLS termination ──────────────────────────────────────
+          ##  The ingress listener terminates TLS with the dstack-minted
+          ##  RA-TLS certificate. `gm-miner-ratls` writes the PEM key and
+          ##  cert to /tmp/gm-ratls/ before envoy starts (see start.sh);
+          ##  that step runs to completion first and a dstack failure
+          ##  aborts the container, so envoy never boots without the cert
+          ##  files in place.
+          ##
+          ##  No `validation_context` — the miner data plane does not
+          ##  request a client certificate. Caller identity is proven by
+          ##  the `x-gm-node-key` header (Mechanism 1, the Lua filter
+          ##  below); this TLS context exists to prove the *miner's*
+          ##  attestation to the gateway, the opposite direction. The
+          ##  certificate the gateway receives carries the TDX quote.
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                ## Advertise h2 then http/1.1 on ALPN. Order matters:
+                ## h2 first means a client offering both gets h2; a
+                ## client offering only http/1.1 still gets h1 (Envoy
+                ## falls back to the first overlap). Pairs with
+                ## `codec_type: AUTO` on the HCM above.
+                alpn_protocols: ["h2", "http/1.1"]
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /tmp/gm-ratls/cert.pem
+                    private_key:
+                      filename: /tmp/gm-ratls/key.pem
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                ## ── HTTP/2 via ALPN ─────────────────────────────────
+                ##  Envoy's HCM default is HTTP/1.1 only. `AUTO` selects
+                ##  h1 or h2 per connection based on the ALPN protocol
+                ##  the client negotiated during the TLS handshake.
+                ##  Backward-compatible with existing h1 callers (the
+                ##  gateway with prior-knowledge off, the registry's
+                ##  control-loop probes, auditors, the benchmark runner)
+                ##  and forward-compatible with h2-capable clients
+                ##  (the gateway once GM_MINER_HTTP2_PRIOR_KNOWLEDGE=1).
+                ##  Pair with `alpn_protocols: ["h2","http/1.1"]` on the
+                ##  DownstreamTlsContext below — Envoy advertises h2
+                ##  first, falls back to h1 for clients that don't
+                ##  offer h2.
+                codec_type: AUTO
+                use_remote_address: true
+                ## ── HTTP/1.1 stream-level error isolation ───────────
+                ##  Without this, a malformed HTTP/1.1 request closes
+                ##  the whole connection. The HTTP/2 codec's equivalent
+                ##  switch lives on `http2_protocol_options` below and
+                ##  is the load-bearing one for h2: a single buyer's
+                ##  bad request would otherwise reset every other
+                ##  multiplexed stream on the same connection — at ~800
+                ##  concurrent SSE streams that is hundreds of
+                ##  collateral cancellations per malformed request.
+                stream_error_on_invalid_http_message: true
+                http2_protocol_options:
+                  ## ── HTTP/2 stream-level error isolation ──────────
+                  ##  Treat malformed requests as STREAM errors rather
+                  ##  than connection-level errors. Without this, a
+                  ##  single buyer's bad frame would `GOAWAY` the whole
+                  ##  h2 connection and drop every other in-flight
+                  ##  stream — at the ~800 concurrent SSE level the
+                  ##  hot-path optimisation iter-3 confirmed, that is
+                  ##  the dominant tail-latency event.
+                  override_stream_error_on_invalid_http_message: true
+                  ## ── Concurrent-stream ceiling ────────────────────
+                  ##  Advertised to the gateway in the h2 SETTINGS
+                  ##  frame. Envoy's documented default is 2^31-1
+                  ##  (effectively unbounded). Pinning to 1024 makes
+                  ##  the explicit ceiling visible to operators and
+                  ##  matches the gateway-side cap; it sits well
+                  ##  inside the listener's overload-manager / fd-
+                  ##  budget envelope, which caps downstream
+                  ##  connections at 8192 above.
+                  max_concurrent_streams: 1024
+                ## ── Rate-limited response body ──────────────────────
+                ##  The local rate-limit filter's own 429 carries the
+                ##  plain-text body `local_rate_limited`. Every other
+                ##  error this data plane emits (the 501 provider
+                ##  catch-all, the 401 node-key reject) is a JSON
+                ##  `{"error":...}` object; this mapper rewrites the
+                ##  rate-limit 429 to the same shape so a caller parses
+                ##  one error format.
+                ##
+                ##  The match is a status-code filter on 429, not the
+                ##  `RL` response flag: the local rate-limit filter
+                ##  rejects in the filter chain before the router runs,
+                ##  and `RL` is a router-set flag, so it is never
+                ##  present on a locally-rate-limited reply. 429 is
+                ##  unambiguous here — the rate-limit filter is the only
+                ##  thing on this data plane that produces it (the 401
+                ##  and 501 replies carry their own codes and their own
+                ##  JSON bodies, untouched by this mapper).
+                local_reply_config:
+                  mappers:
+                    - filter:
+                        status_code_filter:
+                          comparison:
+                            op: EQ
+                            value:
+                              default_value: 429
+                              runtime_key: local_reply.rate_limited.status
+                      body_format_override:
+                        json_format:
+                          error: "miner saturated — request rate limited"
+                route_config:
+                  name: provider_routes
+                  virtual_hosts:
+                    - name: providers
+                      domains: ["*"]
+                      routes:
+
+                        ## ── Attestation surface ─────────────────────────────
+                        ##  GET /attestation/info is the miner's TEE
+                        ##  attestation endpoint — the registry's control
+                        ##  loop probes it once per cycle to verify the
+                        ##  miner runs an approved image inside a real TDX
+                        ##  CVM. It is served by the co-located
+                        ##  `gm-miner-attestd` process (see start.sh), not
+                        ##  by an upstream provider, so this route is
+                        ##  matched first and forwarded to the loopback
+                        ##  attestd cluster.
+                        ##
+                        ##  The endpoint is public by contract
+                        ##  (gm/docs/contracts/gateway-attestation-info.md):
+                        ##  the registry probes it WITHOUT the
+                        ##  x-gm-node-key header, and auditors curl it
+                        ##  directly. The inbound Lua filter below skips
+                        ##  the node-secret check for this exact path.
+                        - match:
+                            path: "/attestation/info"
+                          route:
+                            cluster: attestd
+                            timeout: 10s
+                          ## Exempt the attestation surface from the
+                          ##  inbound rate limit. The registry's control
+                          ##  loop probes this path every cycle and
+                          ##  auditors curl it directly — it must answer
+                          ##  even while the miner is shedding inference
+                          ##  load, otherwise saturation reads as the
+                          ##  miner being down. An empty token_bucket
+                          ##  with the filter disabled turns the
+                          ##  rate-limit check off for this route only.
+                          typed_per_filter_config:
+                            envoy.filters.http.local_ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                              stat_prefix: ingress_http_rate_limit_attestation
+                              token_bucket:
+                                max_tokens: 1
+                                tokens_per_fill: 1
+                                fill_interval: 1s
+                              filter_enabled:
+                                default_value:
+                                  numerator: 0
+                                  denominator: HUNDRED
+                              filter_enforced:
+                                default_value:
+                                  numerator: 0
+                                  denominator: HUNDRED
+
+                        ## ── Anthropic ───────────────────────────────────────
+                        ##  Enabled only when ANTHROPIC_API_KEY is set.
+                        ##  The route matches any path beginning with /v1/ that
+                        ##  was tagged with x-gm-product: anthropic/* by the
+                        ##  gateway. The header x-gm-provider is set by the
+                        ##  gateway; we use it as the route discriminator so
+                        ##  Envoy's static config can separate providers while
+                        ##  the template engine strips the route block entirely
+                        ##  when the key is absent.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "anthropic"
+                          route:
+                            cluster: anthropic
+                            host_rewrite_literal: api.anthropic.com
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - authorization
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                          request_headers_to_add:
+                            - header:
+                                key: x-api-key
+                                value: "%ENVIRONMENT(ANTHROPIC_API_KEY)%"
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                            - header:
+                                key: anthropic-version
+                                value: "2023-06-01"
+                              append_action: ADD_IF_ABSENT
+
+                        ## ── OpenAI ──────────────────────────────────────────
+                        ##  Enabled only when OPENAI_API_KEY is set.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "openai"
+                          route:
+                            cluster: openai
+                            host_rewrite_literal: api.openai.com
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - authorization
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                          request_headers_to_add:
+                            - header:
+                                key: authorization
+                                value: "Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+
+                        ## ── Gemini ──────────────────────────────────────────
+                        ##  Enabled only when GOOGLE_API_KEY is set.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "gemini"
+                          route:
+                            cluster: gemini
+                            host_rewrite_literal: generativelanguage.googleapis.com
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - authorization
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                          request_headers_to_add:
+                            - header:
+                                key: x-goog-api-key
+                                value: "%ENVIRONMENT(GOOGLE_API_KEY)%"
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+
+                        ## ── Benchmark ───────────────────────────────────────
+                        ##  A plain proxy to the synthetic benchmark upstream —
+                        ##  no API key, no upstream auth header. start.sh
+                        ##  resolves the per-network URL from GM_NETWORK and
+                        ##  substitutes the cluster host/port into the
+                        ##  placeholders below.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "benchmark"
+                          route:
+                            cluster: benchmark
+                            host_rewrite_literal: __GM_BENCHMARK_HOST__
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+
+                        ## ── Fallback: no provider matched ─────────────────────
+                        ##  Catch-all for requests whose `x-gm-provider` header
+                        ##  is absent or names a provider with no route above.
+                        ##  Returns HTTP 501. A request that *does* match a
+                        ##  provider route whose API key env var is unset is
+                        ##  routed upstream instead and fails there with 401
+                        ##  (see start.sh). This is the "route is disabled"
+                        ##  state described in spec §10.2.
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 501
+                            body:
+                              inline_string: |
+                                {"error":"provider not configured on this miner"}
+
+                http_filters:
+                  ## ── Inbound node-secret auth ────────────────────────
+                  ##  Mechanism 1 of attestation-and-identity.md. The Lua
+                  ##  filter compares the `x-gm-node-key` request header
+                  ##  against the expected secret and rejects a mismatch
+                  ##  with 401 before any route runs.
+                  ##
+                  ##  `start.sh` substitutes the `__GM_NODE_SECRET__`
+                  ##  placeholder below with the value of the
+                  ##  `GM_NODE_SECRET` env var at container start, then
+                  ##  execs envoy against the rendered config. The secret
+                  ##  is a config literal at runtime — the filter does not
+                  ##  depend on Lua reading the process environment, which
+                  ##  Envoy's Lua sandbox does not document as supported.
+                  ##  When `GM_NODE_SECRET` is unset `start.sh` substitutes
+                  ##  an empty string and the filter skips the check, so a
+                  ##  miner predating node-secret auth still serves.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          local expected = "__GM_NODE_SECRET__"
+                          function envoy_on_request(handle)
+                            if expected == "" then
+                              return
+                            end
+                            -- The attestation surface is public by
+                            -- contract: the registry's control loop
+                            -- probes GET /attestation/info WITHOUT the
+                            -- node secret, and auditors curl it. Skip
+                            -- the inbound node-secret check for that
+                            -- path; every other path on the data plane
+                            -- still requires x-gm-node-key. The :path
+                            -- pseudo-header carries the query string
+                            -- (?nonce=...), so strip it before matching.
+                            local path = handle:headers():get(":path") or ""
+                            local bare = path:match("^[^?]*")
+                            if bare == "/attestation/info" then
+                              return
+                            end
+                            local presented = handle:headers():get("x-gm-node-key")
+                            if presented ~= expected then
+                              handle:respond(
+                                {[":status"] = "401",
+                                 ["content-type"] = "application/json"},
+                                "{\"error\":\"missing or invalid x-gm-node-key\"}")
+                            end
+                          end
+                  ## ── Graceful load shedding ──────────────────────────
+                  ##  The miner's saturation signal. Without it a miner
+                  ##  past its capacity sheds load by resetting
+                  ##  connections — the admission benchmark saw connection
+                  ##  resets / `unexpected EOF` / timeouts and zero 429s
+                  ##  at any scale, so saturation was invisible to the
+                  ##  whole control plane. The gateway router and the
+                  ##  registry admission loop both treat HTTP 429 as the
+                  ##  "miner is saturated" signal; this filter is what
+                  ##  emits it.
+                  ##
+                  ##  Mechanism: a token bucket on inbound request rate.
+                  ##  `max_tokens` tokens refill every `fill_interval`;
+                  ##  each request spends one. When the bucket is empty
+                  ##  the request is rejected immediately with HTTP 429
+                  ##  instead of being admitted, held open as a stream,
+                  ##  and contributing to the overload that resets
+                  ##  connections. Capping request admission caps the
+                  ##  growth of concurrent streams: a request that gets a
+                  ##  429 never becomes a held-open connection. The HCM's
+                  ##  `local_reply_config` above rewrites that 429 to the
+                  ##  data plane's JSON `{"error":...}` shape.
+                  ##
+                  ##  Sizing: 500 tokens, full refill every second — the
+                  ##  miner admits a sustained 500 requests/sec and
+                  ##  bursts to 500. The admission benchmark drove
+                  ##  ungraceful degradation from a few hundred
+                  ##  concurrent connections upward; 500/s sits in that
+                  ##  band, so a saturation ramp trips a clean 429 well
+                  ##  before connection count could approach the
+                  ##  overload manager's fd-exhaustion ceiling. The
+                  ##  numbers are deliberately conservative and tunable
+                  ##  — they bound the image until per-CVM benchmarking
+                  ##  refines them; a change here re-measures the
+                  ##  compose hash.
+                  ##
+                  ##  The bucket is process-wide (not
+                  ##  per-downstream-connection): the limit is the
+                  ##  miner's whole-node admission rate, matching how the
+                  ##  gateway and registry reason about a miner's
+                  ##  capacity. `/attestation/info` is exempted via a
+                  ##  per-route override below — the registry's control
+                  ##  loop and auditors must still reach the attestation
+                  ##  surface while the miner is shedding inference load.
+                  - name: envoy.filters.http.local_ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                      stat_prefix: ingress_http_rate_limit
+                      token_bucket:
+                        max_tokens: 500
+                        tokens_per_fill: 500
+                        fill_interval: 1s
+                      filter_enabled:
+                        default_value:
+                          numerator: 100
+                          denominator: HUNDRED
+                      filter_enforced:
+                        default_value:
+                          numerator: 100
+                          denominator: HUNDRED
+                  ## The router filter terminates the chain.
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    ## ── Prometheus metrics listener ──────────────────────────────────
+    ##  Surfaces ONLY `/stats/prometheus` to the outside. The full Envoy
+    ##  admin interface on :9901 (loopback) also serves `/quitquitquit`,
+    ##  a live config dump, and other privileged endpoints — none of
+    ##  those may be reachable from outside the CVM. This listener's
+    ##  route table matches the single exact path `/stats/prometheus`
+    ##  and forwards it to the `metrics_admin` loopback cluster (the
+    ##  admin port); every other path falls through to a 404. The admin
+    ##  interface itself stays loopback-only.
+    ##
+    ##  Plaintext, no TLS: unlike the :8080 data plane this listener does
+    ##  not carry buyer content or upstream keys, only Envoy's own
+    ##  operational counters, and the dstack ingress already fronts the
+    ##  port with TLS at its edge for the default `<app-id>-9902` URL.
+    ##
+    ##  The node-secret Lua gate is reused here (the same
+    ##  `__GM_NODE_SECRET__` literal start.sh renders into the data
+    ##  plane's filter): metrics are gated on `x-gm-node-key` so they are
+    ##  not wide-open — every legitimate scraper (the registry control
+    ##  loop, the benchmark runner) already holds the node key. Unlike
+    ##  the data plane there is no `/attestation/info` exemption: every
+    ##  path on this listener requires the header. When GM_NODE_SECRET is
+    ##  unset start.sh renders an empty literal and the gate is skipped,
+    ##  matching the data plane's pre-Mechanism-1 posture.
+    - name: metrics
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 9902
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: metrics_http
+                route_config:
+                  name: metrics_routes
+                  virtual_hosts:
+                    - name: metrics
+                      domains: ["*"]
+                      routes:
+                        ## Exact-path match: only /stats/prometheus is
+                        ## proxied to the admin port. The header strip
+                        ## keeps the node key out of the loopback hop.
+                        - match:
+                            path: "/stats/prometheus"
+                          route:
+                            cluster: metrics_admin
+                            timeout: 10s
+                          request_headers_to_remove:
+                            - x-gm-node-key
+                        ## Every other path — including the rest of the
+                        ## admin surface — returns 404 and never reaches
+                        ## the admin port.
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 404
+                            body:
+                              inline_string: |
+                                {"error":"not found; only /stats/prometheus is exposed"}
+                http_filters:
+                  ## Same node-secret gate as the data plane, without
+                  ## the /attestation/info exemption — every path here
+                  ## requires x-gm-node-key. start.sh substitutes
+                  ## __GM_NODE_SECRET__ with the GM_NODE_SECRET env var;
+                  ## an empty literal (var unset) skips the check.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          local expected = "__GM_NODE_SECRET__"
+                          function envoy_on_request(handle)
+                            if expected == "" then
+                              return
+                            end
+                            local presented = handle:headers():get("x-gm-node-key")
+                            if presented ~= expected then
+                              handle:respond(
+                                {[":status"] = "401",
+                                 ["content-type"] = "application/json"},
+                                "{\"error\":\"missing or invalid x-gm-node-key\"}")
+                            end
+                          end
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+
+    ## ── Attestation server ────────────────────────────────────────────
+    ##  The co-located `gm-miner-attestd` process. It binds loopback only
+    ##  (127.0.0.1:8081 — see start.sh / GM_ATTESTD_BIND_ADDR); envoy is
+    ##  the only thing that reaches it. Plaintext HTTP/1.1 over loopback
+    ##  inside the TEE — no TLS, no SNI: the hop never leaves the
+    ##  container's network namespace.
+    - name: attestd
+      type: STATIC
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: attestd
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8081
+
+    ## ── Metrics admin ─────────────────────────────────────────────────
+    ##  Envoy's own admin interface on loopback (127.0.0.1:9901 — see the
+    ##  `admin` block above). The `metrics` listener forwards exactly one
+    ##  path, `/stats/prometheus`, to this cluster; the admin port is
+    ##  never bound to a routable address. Plaintext HTTP/1.1 over
+    ##  loopback inside the TEE — the hop stays in the container's
+    ##  network namespace.
+    - name: metrics_admin
+      type: STATIC
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: metrics_admin
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9901
+
+    ## ── Anthropic ─────────────────────────────────────────────────────
+    - name: anthropic
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: anthropic
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: api.anthropic.com
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: api.anthropic.com
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: api.anthropic.com
+
+    ## ── OpenAI ────────────────────────────────────────────────────────
+    - name: openai
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: openai
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: api.openai.com
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: api.openai.com
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: api.openai.com
+
+    ## ── Gemini ────────────────────────────────────────────────────────
+    - name: gemini
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: gemini
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: generativelanguage.googleapis.com
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: generativelanguage.googleapis.com
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: generativelanguage.googleapis.com
+
+    ## ── Benchmark ─────────────────────────────────────────────────────
+    ##  Synthetic benchmark upstream. start.sh substitutes the host/port
+    ##  placeholders from the per-network URL it resolves from
+    ##  GM_NETWORK, and keeps or drops the `gm:benchmark-tls` sentinel
+    ##  block below depending on the URL's scheme — kept for https,
+    ##  dropped for http. When dropped the cluster is plain HTTP/1.1.
+    - name: benchmark
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: benchmark
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: __GM_BENCHMARK_HOST__
+                      port_value: __GM_BENCHMARK_PORT__
+      ## gm:benchmark-tls-begin
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: __GM_BENCHMARK_HOST__
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: __GM_BENCHMARK_HOST__
+      ## gm:benchmark-tls-end

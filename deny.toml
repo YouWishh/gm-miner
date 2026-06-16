@@ -1,0 +1,39 @@
+[advisories]
+yanked = "deny"
+# `paste` is unmaintained but has no known vulnerability. It enters the
+# tree transitively via dstack-sdk -> alloy -> alloy-primitives, which
+# the miner's attestation server (attestd) depends on for the dstack
+# guest-agent client. There is no fix to adopt until alloy drops the
+# dependency upstream; the gm gateway repo carries the same ignore.
+ignore = [
+    "RUSTSEC-2024-0436",  # paste crate unmaintained (transitive via dstack-sdk)
+    # proc-macro-error2 is unmaintained but carries no known vulnerability.
+    # It enters the tree transitively via dstack-sdk -> alloy -> the
+    # alloy-sol-macro proc-macro chain. No fix to adopt until alloy drops
+    # the dependency upstream; the gm gateway repo carries the same ignore.
+    "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained (transitive via dstack-sdk)
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards         = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
