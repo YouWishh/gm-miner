@@ -1044,6 +1044,17 @@ fn poll_phala_cvm_outcome(
 /// Render the `phala deploy` env file body from the provider keys, node
 /// secret, and (optional) private-registry pull credentials.
 ///
+/// Every provider key NAME is written on its own line unconditionally — a
+/// configured key gets `NAME=<value>`, an unset key gets a bare `NAME=`
+/// (empty value). The `phala` CLI derives the CVM's measured `allowed_envs`
+/// from the `.env` line keys, keeping any key whose line is non-blank
+/// regardless of its value, so emitting every name fixes `allowed_envs` to
+/// the canonical set ([`compose_hash::CANONICAL_ALLOWED_ENVS`]) and makes
+/// every miner produce the same `compose_hash` no matter which providers
+/// they configured. An empty value is harmless: that upstream just returns
+/// 401, the registry capability probe excludes it, and no pool forms. The
+/// name order matches `CANONICAL_ALLOWED_ENVS`.
+///
 /// Extracted as a pure function so the exact env-file contents can be
 /// asserted in tests without touching the filesystem.
 #[must_use]
@@ -1053,24 +1064,15 @@ pub fn render_env_file(
     registry_creds: Option<&RegistryCredentials>,
 ) -> String {
     let mut lines = String::new();
-    if let Some(k) = &env_vars.anthropic {
-        lines.push_str("ANTHROPIC_API_KEY=");
-        lines.push_str(k);
-        lines.push('\n');
-    }
-    if let Some(k) = &env_vars.openai {
-        lines.push_str("OPENAI_API_KEY=");
-        lines.push_str(k);
-        lines.push('\n');
-    }
-    if let Some(k) = &env_vars.google {
-        lines.push_str("GOOGLE_API_KEY=");
-        lines.push_str(k);
-        lines.push('\n');
-    }
-    if let Some(k) = &env_vars.chutes {
-        lines.push_str("CHUTES_API_KEY=");
-        lines.push_str(k);
+    for (name, value) in [
+        ("ANTHROPIC_API_KEY", env_vars.anthropic.as_deref()),
+        ("OPENAI_API_KEY", env_vars.openai.as_deref()),
+        ("GOOGLE_API_KEY", env_vars.google.as_deref()),
+        ("CHUTES_API_KEY", env_vars.chutes.as_deref()),
+    ] {
+        lines.push_str(name);
+        lines.push('=');
+        lines.push_str(value.unwrap_or(""));
         lines.push('\n');
     }
     // The node secret envoy enforces as the x-gm-node-key header. Always
@@ -1967,6 +1969,12 @@ mod tests {
 
     // ── env-file rendering ────────────────────────────────────────────────────
 
+    /// Configured keys carry their value; unset keys are still emitted as
+    /// bare `NAME=` lines. The `phala` CLI reads every non-blank line's key
+    /// into the CVM's measured `allowed_envs`, so writing all four provider
+    /// names unconditionally fixes the canonical set regardless of which
+    /// keys the miner set — the invariant that makes every miner produce the
+    /// same `compose_hash`.
     #[test]
     fn render_env_file_writes_node_secret_and_keys() {
         let keys = ProviderKeys {
@@ -1979,6 +1987,10 @@ mod tests {
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
         assert!(body.contains("CHUTES_API_KEY=cpk-chutes\n"));
         assert!(body.contains("GM_NODE_SECRET=node-secret-xyz\n"));
+        // Unset keys are emitted as empty-value lines so their names still
+        // land in the CVM's measured allowed_envs.
+        assert!(body.contains("OPENAI_API_KEY=\n"));
+        assert!(body.contains("GOOGLE_API_KEY=\n"));
         assert!(
             !body.contains("DSTACK_DOCKER_"),
             "no registry creds must be written when none are supplied"
@@ -1986,6 +1998,38 @@ mod tests {
         assert!(
             !body.contains("GM_BENCHMARK_UPSTREAM_URL"),
             "GM_BENCHMARK_UPSTREAM_URL must no longer be written to the env file"
+        );
+    }
+
+    /// Every canonical provider key NAME is present on its own line — in the
+    /// `CANONICAL_ALLOWED_ENVS` order — even when the miner configured only
+    /// one provider. This is the env-file half of the static-`allowed_envs`
+    /// invariant: the `phala` CLI maps these line keys into the measured
+    /// `allowed_envs`, so the set is identical for every miner.
+    #[test]
+    fn render_env_file_always_emits_every_provider_name() {
+        let keys = ProviderKeys {
+            anthropic: None,
+            openai: None,
+            google: None,
+            chutes: Some("cpk-only".to_owned()),
+        };
+        let body = render_env_file(&keys, "node-secret", None);
+        let names: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.split('=').next())
+            .filter(|n| !n.is_empty())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GOOGLE_API_KEY",
+                "CHUTES_API_KEY",
+                "GM_NODE_SECRET",
+            ],
+            "the env file must declare every canonical name in CANONICAL_ALLOWED_ENVS order"
         );
     }
 
