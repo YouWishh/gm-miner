@@ -262,7 +262,7 @@ enum Command {
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
         gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5")]
     DeclareProduct {
-        /// Provider: anthropic, openai, or gemini.
+        /// Provider: anthropic, openai, gemini, or chutes.
         #[arg(long)]
         provider: Provider,
 
