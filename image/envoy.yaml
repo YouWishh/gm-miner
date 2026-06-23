@@ -316,7 +316,14 @@ static_resources:
                                   exact: "anthropic"
                           route:
                             cluster: anthropic
-                            host_rewrite_literal: api.anthropic.com
+                            host_rewrite_literal: __GM_ANTHROPIC_HOST__
+                            ## gm:anthropic-path-rewrite-begin
+                            regex_rewrite:
+                              pattern:
+                                google_re2: {}
+                                regex: "^/v1/messages$"
+                              substitution: "/anthropic/v1/messages"
+                            ## gm:anthropic-path-rewrite-end
                             timeout: 120s
                           request_headers_to_remove:
                             - authorization
@@ -327,13 +334,13 @@ static_resources:
                             - x-gm-provider
                           request_headers_to_add:
                             - header:
-                                key: x-api-key
-                                value: "%ENVIRONMENT(ANTHROPIC_API_KEY)%"
+                                key: __GM_ANTHROPIC_AUTH_HEADER__
+                                value: "__GM_ANTHROPIC_AUTH_VALUE__"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
                             - header:
                                 key: anthropic-version
                                 value: "2023-06-01"
-                              append_action: ADD_IF_ABSENT
+                              append_action: __GM_ANTHROPIC_VERSION_APPEND_ACTION__
 
                         ## ── OpenAI ──────────────────────────────────────────
                         ##  Enabled only when OPENAI_API_KEY is set.
@@ -345,7 +352,14 @@ static_resources:
                                   exact: "openai"
                           route:
                             cluster: openai
-                            host_rewrite_literal: api.openai.com
+                            host_rewrite_literal: __GM_OPENAI_HOST__
+                            ## gm:openai-path-rewrite-begin
+                            regex_rewrite:
+                              pattern:
+                                google_re2: {}
+                                regex: "^/v1/chat/completions$"
+                              substitution: "/openai/v1/chat/completions"
+                            ## gm:openai-path-rewrite-end
                             timeout: 120s
                           request_headers_to_remove:
                             - authorization
@@ -356,8 +370,8 @@ static_resources:
                             - x-gm-provider
                           request_headers_to_add:
                             - header:
-                                key: authorization
-                                value: "Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
+                                key: __GM_OPENAI_AUTH_HEADER__
+                                value: "__GM_OPENAI_AUTH_VALUE__"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
 
                         ## ── Chutes ──────────────────────────────────────────
@@ -710,13 +724,13 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: api.anthropic.com
-                      port_value: 443
+                      address: __GM_ANTHROPIC_HOST__
+                      port_value: __GM_ANTHROPIC_PORT__
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          sni: api.anthropic.com
+          sni: __GM_ANTHROPIC_HOST__
           common_tls_context:
             validation_context:
               trusted_ca:
@@ -724,7 +738,7 @@ static_resources:
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
-                    exact: api.anthropic.com
+                    __GM_ANTHROPIC_SAN_MATCH__: __GM_ANTHROPIC_SAN_VALUE__
 
     ## ── OpenAI ────────────────────────────────────────────────────────
     - name: openai
@@ -743,13 +757,13 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: api.openai.com
-                      port_value: 443
+                      address: __GM_OPENAI_HOST__
+                      port_value: __GM_OPENAI_PORT__
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          sni: api.openai.com
+          sni: __GM_OPENAI_HOST__
           common_tls_context:
             validation_context:
               trusted_ca:
@@ -757,7 +771,7 @@ static_resources:
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
-                    exact: api.openai.com
+                    __GM_OPENAI_SAN_MATCH__: __GM_OPENAI_SAN_VALUE__
 
     ## ── Chutes ────────────────────────────────────────────────────────
     - name: chutes

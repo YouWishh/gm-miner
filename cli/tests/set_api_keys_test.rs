@@ -213,6 +213,7 @@ fn any_set_true_when_anthropic_set() {
         openai: None,
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(keys.any_set());
 }
@@ -224,6 +225,7 @@ fn any_set_true_when_openai_set() {
         openai: Some("k".to_owned()),
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(keys.any_set());
 }
@@ -235,6 +237,7 @@ fn any_set_true_when_google_set() {
         openai: None,
         google: Some("k".to_owned()),
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(keys.any_set());
 }
@@ -249,6 +252,7 @@ fn any_set_false_for_empty_string() {
         openai: None,
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(!keys.any_set(), "Some(\"\") must not count as set");
 }
@@ -261,6 +265,7 @@ fn any_set_false_for_whitespace_only() {
         openai: Some("  ".to_owned()),
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(!keys.any_set());
 }
@@ -272,8 +277,121 @@ fn any_set_true_when_chutes_set() {
         openai: None,
         google: None,
         chutes: Some("k".to_owned()),
+        ..ProviderKeys::default()
     };
     assert!(keys.any_set());
+}
+
+#[test]
+fn any_set_true_when_bedrock_selected_and_key_set() {
+    let keys = ProviderKeys {
+        anthropic_upstream: Some("bedrock".to_owned()),
+        bedrock_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(keys.any_set());
+}
+
+#[test]
+fn any_set_true_when_azure_selected_and_key_set() {
+    let keys = ProviderKeys {
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(keys.any_set());
+}
+
+#[test]
+fn cloud_key_without_selector_does_not_pass_preflight() {
+    let keys = ProviderKeys {
+        bedrock_api_key: Some("k".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(!keys.any_set());
+}
+
+#[test]
+fn validate_upstreams_rejects_incomplete_bedrock() {
+    let keys = ProviderKeys {
+        anthropic_upstream: Some("bedrock".to_owned()),
+        bedrock_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(err.contains("--bedrock-region"), "{err}");
+}
+
+#[test]
+fn validate_upstreams_rejects_malformed_bedrock_region() {
+    let keys = ProviderKeys {
+        anthropic_upstream: Some("bedrock".to_owned()),
+        bedrock_region: Some("us-west-2.evil.example".to_owned()),
+        bedrock_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(
+        err.contains("--bedrock-region must contain only letters, numbers, and hyphens"),
+        "{err}"
+    );
+}
+
+#[test]
+fn validate_upstreams_rejects_incomplete_azure() {
+    let keys = ProviderKeys {
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(err.contains("--azure-openai-endpoint"), "{err}");
+}
+
+#[test]
+fn validate_upstreams_rejects_non_https_azure_endpoint() {
+    let keys = ProviderKeys {
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_endpoint: Some("http://r.openai.azure.com".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(
+        err.contains("--azure-openai-endpoint must use https"),
+        "{err}"
+    );
+}
+
+#[test]
+fn validate_upstreams_rejects_non_allowed_azure_endpoint() {
+    let keys = ProviderKeys {
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_endpoint: Some("https://api.evil.example".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(
+        err.contains("host 'api.evil.example' is not in the allowed suffix set"),
+        "{err}"
+    );
+}
+
+#[test]
+fn validate_upstreams_accepts_complete_cloud_and_direct() {
+    let complete = ProviderKeys {
+        anthropic_upstream: Some("bedrock".to_owned()),
+        bedrock_region: Some("us-west-2".to_owned()),
+        bedrock_api_key: Some("k".to_owned()),
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_endpoint: Some("https://r.openai.azure.com".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(complete.validate_upstreams().is_ok());
+    assert!(ProviderKeys::default().validate_upstreams().is_ok());
 }
 
 // ── Empty-key rejection in set-api-keys ──────────────────────────────────────

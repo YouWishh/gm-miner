@@ -127,6 +127,12 @@ pub struct WorkerRecord {
     /// The worker's `x-gm-node-key` pre-shared credential (Mechanism 1 of
     /// `docs/plans/attestation-and-identity.md`).
     pub node_secret: String,
+    /// Registry worker provenance derived from the provider upstream selectors
+    /// active when this worker was deployed. Stored per worker so
+    /// `register-image` recovery preserves the deployed backend instead of
+    /// relabeling from whatever global config is current later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     /// Set on a *provisional* record (empty `worker_id`) that a `worker add`
     /// wrote before its registry POST — i.e. an in-flight or failed secondary
     /// worker. It keeps that stub off the worker-#1 registration paths
@@ -312,26 +318,196 @@ pub struct ProviderKeys {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic_upstream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bedrock_region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bedrock_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_upstream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_openai_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_openai_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub google: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chutes: Option<String>,
 }
 
+/// True when `v` holds a non-empty, non-whitespace value. `Some("")` and
+/// `Some("  ")` count as unset so an accidental empty-string assignment (e.g.
+/// from an unset shell variable) doesn't silently pass the deploy preflight.
+fn non_empty(v: Option<&str>) -> bool {
+    v.is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Bail naming every flag in `fields` whose value is unset, for a selected
+/// cloud upstream that `start.sh` would otherwise reject at boot.
+fn require_present(label: &str, fields: &[(&str, Option<&str>)]) -> Result<()> {
+    let missing: Vec<&str> = fields
+        .iter()
+        .filter_map(|(flag, v)| (!non_empty(*v)).then_some(*flag))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "{label} requires {} — set via `gmcli set-api-keys`",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+const AZURE_OPENAI_ALLOWED_SUFFIXES: [&str; 3] = [
+    "openai.azure.com",
+    "services.ai.azure.com",
+    "cognitiveservices.azure.com",
+];
+
+fn validate_bedrock_region(region: &str) -> Result<()> {
+    if region
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("--bedrock-region must contain only letters, numbers, and hyphens")
+    }
+}
+
+fn validate_dns_host(label: &str, host: &str) -> Result<()> {
+    let valid = !host.is_empty()
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..")
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!("{label} must be a DNS host (got '{host}')")
+    }
+}
+
+fn host_allowed_by_suffix(host: &str, suffix: &str) -> bool {
+    host.len() > suffix.len()
+        && host.ends_with(suffix)
+        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+}
+
+fn validate_azure_openai_endpoint(endpoint: &str) -> Result<()> {
+    let mut rest = endpoint;
+    if let Some(stripped) = endpoint.strip_prefix("https://") {
+        rest = stripped;
+    } else if endpoint.starts_with("http://") {
+        anyhow::bail!("--azure-openai-endpoint must use https when a scheme is provided");
+    } else if endpoint.contains("://") {
+        anyhow::bail!("--azure-openai-endpoint has unsupported URL scheme");
+    }
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        anyhow::bail!("--azure-openai-endpoint must not contain userinfo");
+    }
+    let host = authority
+        .split_once(':')
+        .map_or(authority, |(host, _)| host)
+        .to_ascii_lowercase();
+    validate_dns_host("--azure-openai-endpoint host", &host)?;
+
+    if AZURE_OPENAI_ALLOWED_SUFFIXES
+        .iter()
+        .any(|suffix| host_allowed_by_suffix(&host, suffix))
+    {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "--azure-openai-endpoint host '{host}' is not in the allowed suffix set: {}",
+            AZURE_OPENAI_ALLOWED_SUFFIXES.join(", ")
+        )
+    }
+}
+
 impl ProviderKeys {
     /// Returns true if at least one key is set to a non-empty, non-whitespace value.
-    ///
-    /// `Some("")` and `Some("  ")` are treated as not set so that accidental
-    /// empty-string assignments (e.g. from an unset shell variable) don't
-    /// silently pass the deploy preflight check.
     #[must_use]
     pub fn any_set(&self) -> bool {
-        let non_empty = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
-        non_empty(&self.anthropic)
-            || non_empty(&self.openai)
-            || non_empty(&self.google)
-            || non_empty(&self.chutes)
+        let anthropic_upstream = self.anthropic_upstream.as_deref().unwrap_or("direct");
+        let openai_upstream = self.openai_upstream.as_deref().unwrap_or("direct");
+        ((anthropic_upstream == "direct" && non_empty(self.anthropic.as_deref()))
+            || (anthropic_upstream == "bedrock" && non_empty(self.bedrock_api_key.as_deref())))
+            || ((openai_upstream == "direct" && non_empty(self.openai.as_deref()))
+                || (openai_upstream == "azure" && non_empty(self.azure_openai_api_key.as_deref())))
+            || non_empty(self.google.as_deref())
+            || non_empty(self.chutes.as_deref())
+    }
+
+    /// Reject a selected cloud upstream that is missing fields `start.sh`
+    /// requires at boot. Without this, `gmcli deploy` would launch a CVM that
+    /// crash-loops because `start.sh` exits — fail fast at deploy instead.
+    ///
+    /// # Errors
+    /// Returns an error when `anthropic_upstream`/`openai_upstream` is an
+    /// unknown value, or when a selected `bedrock`/`azure` upstream is missing
+    /// a required field.
+    pub fn validate_upstreams(&self) -> Result<()> {
+        match self.anthropic_upstream.as_deref().unwrap_or("direct") {
+            "direct" => {}
+            "bedrock" => {
+                require_present(
+                    "anthropic-upstream=bedrock",
+                    &[
+                        ("--bedrock-region", self.bedrock_region.as_deref()),
+                        ("--bedrock-api-key", self.bedrock_api_key.as_deref()),
+                    ],
+                )?;
+                validate_bedrock_region(self.bedrock_region.as_deref().unwrap_or_default())?;
+            }
+            other => {
+                anyhow::bail!("anthropic-upstream must be 'direct' or 'bedrock' (got '{other}')")
+            }
+        }
+        match self.openai_upstream.as_deref().unwrap_or("direct") {
+            "direct" => {}
+            "azure" => {
+                require_present(
+                    "openai-upstream=azure",
+                    &[
+                        (
+                            "--azure-openai-endpoint",
+                            self.azure_openai_endpoint.as_deref(),
+                        ),
+                        (
+                            "--azure-openai-api-key",
+                            self.azure_openai_api_key.as_deref(),
+                        ),
+                    ],
+                )?;
+                validate_azure_openai_endpoint(
+                    self.azure_openai_endpoint.as_deref().unwrap_or_default(),
+                )?;
+            }
+            other => anyhow::bail!("openai-upstream must be 'direct' or 'azure' (got '{other}')"),
+        }
+        Ok(())
+    }
+
+    /// Registry worker provenance is a single optional backend marker. If both
+    /// cloud upstreams are configured, Bedrock takes precedence; the registry
+    /// only needs "cloud-backed, use the inference probe" here, while each
+    /// offer's `upstream_model` carries the per-model translation detail.
+    #[must_use]
+    pub fn worker_backend(&self) -> Option<&'static str> {
+        if self.anthropic_upstream.as_deref() == Some("bedrock") {
+            Some("bedrock")
+        } else if self.openai_upstream.as_deref() == Some("azure") {
+            Some("azure")
+        } else {
+            None
+        }
     }
 }
 
@@ -641,6 +817,24 @@ mod tests {
     }
 
     #[test]
+    fn worker_backend_defaults_and_omits_when_absent() {
+        let json = r#"{"worker_id":"01J0A","app_id":"app_01J0A","app_name":"gm-miner-1","node_secret":"secret"}"#;
+        let worker: WorkerRecord = serde_json::from_str(json).expect("parse legacy worker record");
+        assert_eq!(worker.backend, None);
+
+        let resaved = serde_json::to_string(&worker).expect("serialize worker record");
+        assert!(
+            !resaved.contains("backend"),
+            "absent worker backend must stay omitted: {resaved}"
+        );
+
+        let mut cloud = worker;
+        cloud.backend = Some("bedrock".to_owned());
+        let cloud_json = serde_json::to_value(&cloud).expect("serialize cloud worker");
+        assert_eq!(cloud_json["backend"], "bedrock");
+    }
+
+    #[test]
     fn empty_workers_vec_is_omitted_from_json() {
         // A network that never deployed must not bloat config.json with an
         // empty `workers` array, matching the skip-if-empty contract.
@@ -744,6 +938,7 @@ mod tests {
                     app_name: "gm-miner-3".to_owned(),
                     node_secret: "s".to_owned(),
                     provisional_secondary: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()

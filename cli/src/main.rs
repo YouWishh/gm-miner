@@ -128,18 +128,47 @@ enum Command {
     ///
     /// Each flag, if provided, replaces the stored value.  Omitted flags
     /// leave existing values intact.  Key values are never echoed back.
+    /// Worker backend provenance is derived from the upstream selectors at deploy time.
     #[command(after_help = "Examples:\n  \
         gmcli set-api-keys --anthropic sk-ant-...\n  \
         gmcli set-api-keys --openai sk-... --google AIza...\n  \
-        gmcli set-api-keys --chutes cpk-...")]
+        gmcli set-api-keys --chutes cpk-...\n  \
+        gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-west-2 \\\n  \
+          --bedrock-api-key brk-...\n  \
+        gmcli set-api-keys --openai-upstream azure --azure-openai-endpoint https://my-resource.openai.azure.com \\\n  \
+          --azure-openai-api-key ...")]
     SetApiKeys {
         /// Anthropic API key (sk-ant-...).
         #[arg(long)]
         anthropic: Option<String>,
 
+        /// Anthropic upstream selector: direct or bedrock.
+        #[arg(long)]
+        anthropic_upstream: Option<String>,
+
+        /// AWS Bedrock region for `ANTHROPIC_UPSTREAM=bedrock`.
+        #[arg(long)]
+        bedrock_region: Option<String>,
+
+        /// AWS Bedrock API key for `ANTHROPIC_UPSTREAM=bedrock`.
+        #[arg(long)]
+        bedrock_api_key: Option<String>,
+
         /// `OpenAI` API key (sk-...).
         #[arg(long)]
         openai: Option<String>,
+
+        /// `OpenAI` upstream selector: direct or azure.
+        #[arg(long)]
+        openai_upstream: Option<String>,
+
+        /// Azure `OpenAI` endpoint URL or host for `OPENAI_UPSTREAM=azure`.
+        #[arg(long)]
+        azure_openai_endpoint: Option<String>,
+
+        /// Azure `OpenAI` API key for `OPENAI_UPSTREAM=azure`.
+        #[arg(long)]
+        azure_openai_api_key: Option<String>,
 
         /// Google API key.
         #[arg(long)]
@@ -272,6 +301,7 @@ enum Command {
     /// whole catalog (or one provider's slice), use `declare-products`.
     #[command(after_help = "Examples:\n  \
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
+        gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 --upstream-model us.anthropic.claude-sonnet-4-6-v1\n  \
         gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5")]
     DeclareProduct {
         /// Provider: anthropic, openai, gemini, or chutes.
@@ -281,6 +311,11 @@ enum Command {
         /// Model identifier, e.g. `claude-sonnet-4-6`.
         #[arg(long)]
         model: String,
+
+        /// Upstream model id for cloud-backed offers, e.g. a Bedrock model id.
+        /// Azure deployments named exactly like the gm model id do not need this.
+        #[arg(long = "upstream-model", value_name = "ID")]
+        upstream_model: Option<String>,
 
         /// Percent off retail; range [0, 99.90]. You will receive
         /// (100 - PCT)% of retail per token (e.g. `--discount-pct 10.5`
@@ -538,6 +573,10 @@ async fn main() -> Result<()> {
 /// Resolve the global flags and run the selected subcommand. Split from
 /// [`main`] so the startup banner/tracing setup stays separate from the
 /// per-command routing.
+#[expect(
+    clippy::too_many_lines,
+    reason = "top-level CLI dispatch is intentionally a flat subcommand match"
+)]
 async fn dispatch(cli: Cli) -> Result<()> {
     let explicit_network = cli.explicit_network();
     let api_url = cli.api_url.clone();
@@ -545,10 +584,28 @@ async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::SetApiKeys {
             anthropic,
+            anthropic_upstream,
+            bedrock_region,
+            bedrock_api_key,
             openai,
+            openai_upstream,
+            azure_openai_endpoint,
+            azure_openai_api_key,
             google,
             chutes,
-        } => cmd_set_api_keys(explicit_network, anthropic, openai, google, chutes),
+        } => cmd_set_api_keys(
+            explicit_network,
+            anthropic,
+            anthropic_upstream,
+            bedrock_region,
+            bedrock_api_key,
+            openai,
+            openai_upstream,
+            azure_openai_endpoint,
+            azure_openai_api_key,
+            google,
+            chutes,
+        ),
         Command::Init { yes } => cmd_init(explicit_network, api_url, yes).await,
         Command::Gm => {
             cmd_gm();
@@ -607,12 +664,20 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::DeclareProduct {
             provider,
             model,
+            upstream_model,
             discount_bp,
         } => {
             let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
-            cmd_declare_product(&mut client, &provider, &model, discount_bp).await
+            cmd_declare_product(
+                &mut client,
+                &provider,
+                &model,
+                discount_bp,
+                upstream_model.as_deref(),
+            )
+            .await
         }
         Command::DeclareProducts {
             provider,
@@ -868,6 +933,7 @@ mod tests {
                         app_name: "gm-miner-2".to_owned(),
                         node_secret: "provisional".to_owned(),
                         provisional_secondary: true,
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -1217,6 +1283,7 @@ mod tests {
                         app_name: "gm-miner-2".to_owned(),
                         node_secret: "provisional".to_owned(),
                         provisional_secondary: true,
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -1256,6 +1323,31 @@ mod tests {
                 discount_bp: 1055,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn clap_accepts_upstream_model_for_single_declare() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "declare-product",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-4-6",
+            "--discount-pct",
+            "5",
+            "--upstream-model",
+            "us.anthropic.claude-sonnet-4-6-v1",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::DeclareProduct {
+                upstream_model: Some(ref upstream_model),
+                ..
+            } if upstream_model == "us.anthropic.claude-sonnet-4-6-v1"
         ));
     }
 
@@ -1634,6 +1726,7 @@ mod tests {
                     openai: None,
                     google: None,
                     chutes: None,
+                    ..ProviderKeys::default()
                 }),
                 ..Default::default()
             }

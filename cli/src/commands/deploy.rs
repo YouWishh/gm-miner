@@ -370,6 +370,10 @@ fn resolve_and_render_target(
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "deploy orchestration is kept flat so the ordered operational steps stay visible"
+)]
 pub(crate) async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
@@ -399,9 +403,14 @@ pub(crate) async fn cmd_deploy(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no provider keys; run `gmcli set-api-keys \
-                 --anthropic <key>` (and/or --openai / --google / --chutes) first"
+                 --anthropic <key>` (and/or --openai / --google / --chutes, \
+                 or configure --anthropic-upstream bedrock / --openai-upstream azure) first"
             )
         })?;
+    keys.validate_upstreams()?;
+    // Derive once so the registry worker-create body and the local
+    // WorkerRecord persist exactly the same backend provenance.
+    let worker_backend = keys.worker_backend().map(str::to_owned);
 
     // Step 1b: resolve the per-worker node secret. Each worker (CVM)
     // carries its own `x-gm-node-key` secret, never shared with a sibling
@@ -442,6 +451,7 @@ pub(crate) async fn cmd_deploy(
                 app_id: String::new(),
                 app_name: args.app_name.clone(),
                 node_secret: node_secret.clone(),
+                backend: worker_backend.clone(),
                 provisional_secondary,
             },
         )?;
@@ -515,6 +525,7 @@ pub(crate) async fn cmd_deploy(
             app_id: actual.app_id.clone(),
             app_name: args.app_name.clone(),
             node_secret: node_secret.clone(),
+            backend: worker_backend.clone(),
             provisional_secondary,
         },
     )?;
@@ -540,6 +551,7 @@ pub(crate) async fn cmd_deploy(
             os_image_hash: &verified.os_image_hash,
             endpoint: &actual.endpoint,
             node_secret: Some(&node_secret),
+            backend: worker_backend.as_deref(),
             accepted_terms_version: Some(terms::CURRENT_TERMS_VERSION),
         },
     )
@@ -557,6 +569,7 @@ pub(crate) async fn cmd_deploy(
             app_id: actual.app_id.clone(),
             app_name: args.app_name.clone(),
             node_secret,
+            backend: worker_backend,
             // Registered: role is read from position, never this flag.
             provisional_secondary: false,
         },
@@ -646,41 +659,11 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
     // enforces, and its `app_name` preserves the operator's original
     // `--app-name`. A worker not tracked locally has neither — the registry
     // then leaves any stored secret untouched.
-    let (node_secret, existing_app_name) = {
-        let entry = cfg.active_network_entry();
-        let tracked = entry.and_then(|n| n.worker_by_app_id(app_id));
-        if let Some(tracked) =
-            tracked.filter(|_| entry.is_some_and(|n| n.is_secondary_by_app_id(app_id)))
-        {
-            // A provisional secondary has no worker_id yet; point `worker
-            // remove` at the app_id, which it also accepts, so the command is
-            // runnable in every case.
-            let remove_handle = if tracked.worker_id.is_empty() {
-                app_id
-            } else {
-                &tracked.worker_id
-            };
-            bail!(
-                "CVM '{app_id}' is a secondary worker (worker '{}'); \
-                 `register-image` only re-registers worker #1. To replace it, \
-                 `gmcli worker remove {}` then `gmcli worker add \
-                 --app-name {}`.",
-                tracked.app_name,
-                remove_handle,
-                tracked.app_name
-            );
-        }
-        // A tracked CVM re-sends its recorded secret. An untracked CVM on a
-        // pre-multi-worker config falls back to the legacy network-level
-        // secret so a resync still restores what envoy enforces; otherwise
-        // the registry leaves its stored secret untouched.
-        let node_secret = tracked.map(|w| w.node_secret.clone()).or_else(|| {
-            entry
-                .and_then(config::NetworkEntry::legacy_node_secret)
-                .map(str::to_owned)
-        });
-        (node_secret, tracked.map(|w| w.app_name.clone()))
-    };
+    let RegisterImageContext {
+        node_secret,
+        existing_app_name,
+        backend: register_backend,
+    } = register_image_context(&cfg, app_id)?;
     let network = cfg.active_network().to_owned();
     // Scope the same Phala key deploy would use (env or saved config key) onto
     // register-image's `phala cvms get`, so a recovery run works off the key
@@ -748,6 +731,12 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
             os_image_hash: &os_image_hash,
             endpoint: &endpoint,
             node_secret: node_secret.as_deref(),
+            // register-image re-registers an already-existing worker. Reuse
+            // the backend recorded at deploy time so a recovery or resync
+            // preserves the worker's provenance instead of relabeling it from
+            // whatever global config is current later. If no local record
+            // exists, current config is only a best-effort fallback.
+            backend: register_backend.as_deref(),
             // A register-image resync re-asserts the image, not the terms; the
             // registry keeps whatever acceptance the first deploy recorded.
             accepted_terms_version: None,
@@ -773,6 +762,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
                 app_id: app_id.to_owned(),
                 app_name,
                 node_secret: secret,
+                backend: register_backend,
                 provisional_secondary: false,
             },
         )?;
@@ -780,6 +770,62 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
 
     println!("  worker_id : {worker_id}");
     Ok(())
+}
+
+fn register_image_backend(record: Option<&WorkerRecord>, cfg: &Config) -> Option<String> {
+    if let Some(record) = record {
+        record.backend.clone()
+    } else {
+        cfg.provider_keys
+            .as_ref()
+            .and_then(|keys| keys.worker_backend().map(str::to_owned))
+    }
+}
+
+struct RegisterImageContext {
+    node_secret: Option<String>,
+    existing_app_name: Option<String>,
+    backend: Option<String>,
+}
+
+fn register_image_context(cfg: &Config, app_id: &str) -> Result<RegisterImageContext> {
+    let entry = cfg.active_network_entry();
+    let tracked = entry.and_then(|n| n.worker_by_app_id(app_id));
+    if let Some(tracked) =
+        tracked.filter(|_| entry.is_some_and(|n| n.is_secondary_by_app_id(app_id)))
+    {
+        // A provisional secondary has no worker_id yet; point `worker remove`
+        // at the app_id, which it also accepts, so the command is runnable in
+        // every case.
+        let remove_handle = if tracked.worker_id.is_empty() {
+            app_id
+        } else {
+            &tracked.worker_id
+        };
+        bail!(
+            "CVM '{app_id}' is a secondary worker (worker '{}'); \
+             `register-image` only re-registers worker #1. To replace it, \
+             `gmcli worker remove {}` then `gmcli worker add \
+             --app-name {}`.",
+            tracked.app_name,
+            remove_handle,
+            tracked.app_name
+        );
+    }
+    // A tracked CVM re-sends its recorded secret. An untracked CVM on a
+    // pre-multi-worker config falls back to the legacy network-level secret so
+    // a resync still restores what envoy enforces; otherwise the registry
+    // leaves its stored secret untouched.
+    let node_secret = tracked.map(|w| w.node_secret.clone()).or_else(|| {
+        entry
+            .and_then(config::NetworkEntry::legacy_node_secret)
+            .map(str::to_owned)
+    });
+    Ok(RegisterImageContext {
+        node_secret,
+        existing_app_name: tracked.map(|w| w.app_name.clone()),
+        backend: register_image_backend(tracked, cfg),
+    })
 }
 
 /// `gmcli publish-image-version` — compute a released image's `ImageVersion`
@@ -846,6 +892,8 @@ struct WorkerImageArgs<'a> {
     /// registry leaves any stored value untouched (a `register-image` for
     /// a worker whose secret the CLI does not track locally).
     node_secret: Option<&'a str>,
+    /// Worker provenance derived from configured upstream selectors.
+    backend: Option<&'a str>,
     /// The gm-miner-terms version the operator accepted, sent on the
     /// first-worker registration so the registry records it on the miner row.
     /// `None` omits the field — the registry leaves any stored value untouched
@@ -863,18 +911,17 @@ async fn post_register_image(
     // non-empty strings. `attestation_endpoint` is reserved for future
     // attested-channel work and not yet consumed by the registry, so the
     // envoy endpoint is sent as a placeholder for both.
-    let mut body = serde_json::json!({
-        "compose_hash": args.compose_hash,
-        "os_image_hash": args.os_image_hash,
-        "endpoint": args.endpoint,
-        "attestation_endpoint": args.endpoint,
-    });
-    // A present secret is stored and served to the gateway (Mechanism 1 of
-    // attestation-and-identity.md). `None` omits the field so the registry
-    // leaves any stored value untouched.
-    if let Some(secret) = args.node_secret {
-        body["node_secret"] = serde_json::Value::String(secret.to_owned());
-    }
+    let mut body = serde_json::to_value(WorkerCreateRequest {
+        endpoint: args.endpoint,
+        // `attestation_endpoint` is reserved for future attested-channel
+        // work; send the envoy endpoint as a placeholder, matching worker add.
+        attestation_endpoint: args.endpoint,
+        compose_hash: args.compose_hash,
+        os_image_hash: args.os_image_hash,
+        node_secret: args.node_secret,
+        backend: args.backend,
+    })
+    .context("serialize register body")?;
     // The accepted terms version, recorded on the miner row keyed to hotkey —
     // the tamper-resistant copy of the local config acceptance. `None` (a
     // register-image resync) leaves any stored value untouched.
@@ -927,6 +974,7 @@ async fn post_add_worker(
         compose_hash: args.compose_hash,
         os_image_hash: args.os_image_hash,
         node_secret: args.node_secret,
+        backend: args.backend,
     })
     .context("serialize worker-add body")?;
 
@@ -1052,4 +1100,66 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
     };
     println!("{reminder}");
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions intentionally panic on unexpected values"
+)]
+mod tests {
+    use super::*;
+    use gm_miner_cli::config::{NetworkEntry, ProviderKeys};
+    use std::collections::HashMap;
+
+    fn cfg_with_keys(keys: ProviderKeys) -> Config {
+        Config {
+            active_network: Some("testnet".to_owned()),
+            provider_keys: Some(keys),
+            networks: HashMap::from([("testnet".to_owned(), NetworkEntry::default())]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn register_image_backend_uses_recorded_backend_over_current_config() {
+        let cfg = cfg_with_keys(ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            azure_openai_api_key: Some("azure-key".to_owned()),
+            ..ProviderKeys::default()
+        });
+        let record = WorkerRecord {
+            worker_id: "01J0A".to_owned(),
+            app_id: "app_01J0A".to_owned(),
+            app_name: "gm-miner-1".to_owned(),
+            node_secret: "secret".to_owned(),
+            backend: Some("bedrock".to_owned()),
+            ..Default::default()
+        };
+
+        let backend = register_image_backend(Some(&record), &cfg);
+        assert_eq!(backend.as_deref(), Some("bedrock"));
+
+        let body = serde_json::to_value(WorkerCreateRequest {
+            endpoint: "https://app_01J0A-8080s.dstack-prod5.phala.network",
+            attestation_endpoint: "https://app_01J0A-8080s.dstack-prod5.phala.network",
+            compose_hash: "a".repeat(64).as_str(),
+            os_image_hash: "b".repeat(64).as_str(),
+            node_secret: Some("secret"),
+            backend: backend.as_deref(),
+        })
+        .expect("serialize register-image request");
+        assert_eq!(body["backend"], "bedrock");
+    }
+
+    #[test]
+    fn register_image_backend_falls_back_to_current_config_without_record() {
+        let cfg = cfg_with_keys(ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            azure_openai_api_key: Some("azure-key".to_owned()),
+            ..ProviderKeys::default()
+        });
+
+        assert_eq!(register_image_backend(None, &cfg).as_deref(), Some("azure"));
+    }
 }
