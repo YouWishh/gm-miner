@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # gm miner container entrypoint.
 #
-# Startup runs one one-shot provisioning step, then launches two
-# co-located long-running processes:
+# Startup runs the required one-shot gates, then launches two co-located
+# long-running processes:
 #
-#   0. gm-miner-ratls (one-shot) — mints the data-plane RA-TLS
+#   0. gm-miner-attestd --verify-azure-once (one-shot, Azure only) —
+#      verifies the configured Azure OpenAI account owner-capture
+#      controls before Envoy can serve Azure traffic. A failure aborts
+#      the container.
+#   1. gm-miner-ratls (one-shot) — mints the data-plane RA-TLS
 #      certificate via dstack's GetTlsKey RPC and writes the key/cert
 #      PEM files envoy's :8080 DownstreamTlsContext references. Runs to
 #      completion before envoy starts; a failure aborts the container.
-#   1. gm-miner-attestd — serves GET /attestation/info with a fresh
+#   2. gm-miner-attestd — serves GET /attestation/info with a fresh
 #      Intel TDX quote from the dstack guest agent. Bound to loopback;
 #      envoy routes the single /attestation/info path to it.
-#   2. envoy — the data plane on :8080. Terminates RA-TLS with the
+#   3. envoy — the data plane on :8080. Terminates RA-TLS with the
 #      minted certificate, proxies provider inference traffic and the
 #      registry's x-gm-provider capability probes, and forwards
 #      /attestation/info to the attestation server.
@@ -292,6 +296,17 @@ if [[ "${benchmark_authority}" == *:* ]]; then
 else
   BENCHMARK_HOST="${benchmark_authority}"
   BENCHMARK_PORT="${benchmark_default_port}"
+fi
+
+# ── Gate Azure data-plane startup ─────────────────────────────────────
+# Render-only mode is an offline config check and never starts Envoy. On
+# real Azure startup, fail closed before rendering/provisioning/launching
+# any serving process: a failed owner-capture check must restart the
+# container rather than allowing Envoy to proxy Azure traffic.
+if [[ "${OPENAI_UPSTREAM}" == "azure" && "${GM_START_RENDER_ONLY:-}" != "1" ]]; then
+  log "verifying Azure OpenAI owner-capture controls before starting data plane"
+  gm-miner-attestd --verify-azure-once
+  log "Azure OpenAI owner-capture verification passed"
 fi
 
 # ── Render the envoy config ───────────────────────────────────────────

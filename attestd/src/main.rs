@@ -36,6 +36,7 @@ const DEFAULT_MINER_ID: &str = "gm-miner";
 /// Default bind address. Loopback only — Envoy reaches it in-container;
 /// nothing external should hit the attestation server directly.
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8081";
+const VERIFY_AZURE_ONCE_ARG: &str = "--verify-azure-once";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,6 +51,18 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args == [VERIFY_AZURE_ONCE_ARG] {
+        tracing::info!("running one-shot Azure OpenAI owner-capture verification");
+        azure_verify::verify_azure_openai_config_from_env()
+            .await
+            .context("Azure OpenAI owner-capture verification failed")?;
+        return Ok(());
+    }
+    if !args.is_empty() {
+        anyhow::bail!("unknown argument(s): {}", args.join(" "));
+    }
 
     let miner_id = std::env::var("GM_MINER_ID").unwrap_or_else(|_| DEFAULT_MINER_ID.to_owned());
     validate_miner_id(&miner_id).map_err(|e| anyhow::anyhow!(e))?;

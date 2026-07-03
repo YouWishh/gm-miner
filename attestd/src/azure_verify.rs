@@ -58,6 +58,7 @@ struct PeriodicAzureVerifySettings {
 struct AzureEndpoint {
     host: String,
     account_name: String,
+    suffix: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,23 +357,28 @@ fn parse_azure_openai_endpoint(endpoint: &str) -> Result<AzureEndpoint> {
         .context("AZURE_OPENAI_ENDPOINT must include a DNS host")?
         .to_ascii_lowercase();
     validate_dns_host("AZURE_OPENAI_ENDPOINT host", &host)?;
-    if !AZURE_OPENAI_ALLOWED_SUFFIXES
+    let suffix = AZURE_OPENAI_ALLOWED_SUFFIXES
         .iter()
-        .any(|suffix| host_allowed_by_suffix(&host, suffix))
-    {
+        .copied()
+        .find(|suffix| host_allowed_by_suffix(&host, suffix));
+    let Some(suffix) = suffix else {
         bail!(
             "AZURE_OPENAI_ENDPOINT host '{host}' is not in the allowed suffix set: {}",
             AZURE_OPENAI_ALLOWED_SUFFIXES
                 .map(|suffix| &suffix[1..])
                 .join(", ")
         );
-    }
+    };
     let account_name = host
         .split('.')
         .next()
         .context("AZURE_OPENAI_ENDPOINT host must contain an account label")?
         .to_owned();
-    Ok(AzureEndpoint { host, account_name })
+    Ok(AzureEndpoint {
+        host,
+        account_name,
+        suffix,
+    })
 }
 
 fn validate_dns_host(label: &str, host: &str) -> Result<()> {
@@ -506,22 +512,36 @@ fn assert_account_binding<'account>(
     if custom_subdomain.trim().is_empty() {
         bail!("Azure account properties.customSubDomainName is empty");
     }
-    let expected_endpoint = format!("https://{custom_subdomain}.openai.azure.com/");
+    let custom_subdomain = custom_subdomain.trim().to_ascii_lowercase();
+    if custom_subdomain != endpoint.account_name {
+        bail!(
+            "Azure account properties.customSubDomainName '{custom_subdomain}' does not match configured endpoint account label '{}'",
+            endpoint.account_name
+        );
+    }
+    let expected_host = format!("{custom_subdomain}{}", endpoint.suffix);
     let arm_endpoint = account
         .properties
         .endpoint
         .as_deref()
         .context("Azure account properties.endpoint is missing")?;
-    if arm_endpoint != expected_endpoint {
-        bail!(
-            "Azure account properties.endpoint '{arm_endpoint}' did not match expected '{expected_endpoint}'",
-        );
+    let arm_url = Url::parse(arm_endpoint)
+        .with_context(|| format!("parse Azure account endpoint {arm_endpoint:?}"))?;
+    if arm_url.scheme() != "https" {
+        bail!("Azure account properties.endpoint must use https");
     }
-    let arm_host = Url::parse(arm_endpoint)
-        .with_context(|| format!("parse Azure account endpoint {arm_endpoint:?}"))?
+    if !arm_url.username().is_empty() || arm_url.password().is_some() {
+        bail!("Azure account properties.endpoint must not contain userinfo");
+    }
+    let arm_host = arm_url
         .host_str()
         .context("Azure account properties.endpoint must include a DNS host")?
         .to_ascii_lowercase();
+    if arm_host != expected_host {
+        bail!(
+            "Azure account properties.endpoint host '{arm_host}' did not match expected '{expected_host}'",
+        );
+    }
     if arm_host != endpoint.host {
         bail!(
             "Azure account endpoint host '{arm_host}' does not match configured AZURE_OPENAI_ENDPOINT host '{}'",
@@ -589,7 +609,7 @@ fn diagnostic_log_is_allowed(log: &DiagnosticLog) -> bool {
 fn classify_verification_error(error: &anyhow::Error) -> VerificationFailureKind {
     for cause in error.chain() {
         if let Some(status_error) = cause.downcast_ref::<AzureHttpStatusError>() {
-            return if status_error.status.is_server_error() {
+            return if status_is_transient(status_error.status) {
                 VerificationFailureKind::Transient
             } else {
                 VerificationFailureKind::Definitive
@@ -599,15 +619,21 @@ fn classify_verification_error(error: &anyhow::Error) -> VerificationFailureKind
             if reqwest_error.is_timeout()
                 || reqwest_error.is_connect()
                 || reqwest_error.is_decode()
-                || reqwest_error
-                    .status()
-                    .is_some_and(|status| status.is_server_error())
+                || reqwest_error.status().is_some_and(status_is_transient)
             {
                 return VerificationFailureKind::Transient;
             }
         }
     }
     VerificationFailureKind::Definitive
+}
+
+fn status_is_transient(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+        )
 }
 
 fn encode_path_segment(input: &str) -> String {
@@ -693,6 +719,44 @@ mod tests {
         let endpoint = valid_endpoint();
         let account = account_from_json(valid_account_json());
         assert!(assert_account_binding(&endpoint, &account).is_ok());
+    }
+
+    #[test]
+    fn account_binding_accepts_services_ai_suffix_matching_endpoint() {
+        let endpoint = parse_azure_openai_endpoint("https://acct.services.ai.azure.com/")
+            .expect("valid endpoint must parse");
+        let account = account_from_json(
+            r#"{
+                "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct",
+                "kind": "AIServices",
+                "properties": {
+                    "customSubDomainName": "acct",
+                    "endpoint": "https://acct.services.ai.azure.com/",
+                    "raiMonitorConfig": null,
+                    "userOwnedStorage": []
+                }
+            }"#,
+        );
+        assert!(assert_account_binding(&endpoint, &account).is_ok());
+    }
+
+    #[test]
+    fn account_binding_rejects_custom_subdomain_mismatch() {
+        let endpoint = valid_endpoint();
+        let account = account_from_json(
+            r#"{
+                "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct",
+                "kind": "OpenAI",
+                "properties": {
+                    "customSubDomainName": "other",
+                    "endpoint": "https://acct.openai.azure.com/"
+                }
+            }"#,
+        );
+        let err = assert_account_binding(&endpoint, &account)
+            .expect_err("custom subdomain mismatch must fail")
+            .to_string();
+        assert!(err.contains("customSubDomainName"), "{err}");
     }
 
     #[test]
@@ -803,6 +867,18 @@ mod tests {
             classify_verification_error(&transient),
             VerificationFailureKind::Transient
         );
+
+        for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::REQUEST_TIMEOUT] {
+            let transient_status = anyhow::Error::new(AzureHttpStatusError {
+                label: "Azure Cognitive Services account",
+                status,
+                body: "throttled".to_owned(),
+            });
+            assert_eq!(
+                classify_verification_error(&transient_status),
+                VerificationFailureKind::Transient
+            );
+        }
 
         let definitive_status = anyhow::Error::new(AzureHttpStatusError {
             label: "Azure Cognitive Services account",
