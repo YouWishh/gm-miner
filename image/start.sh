@@ -194,12 +194,12 @@ case "${OPENAI_UPSTREAM}" in
       openai.azure.com \
       services.ai.azure.com \
       cognitiveservices.azure.com
-    matched_host_suffix "${OPENAI_HOST}" \
+    AZURE_OPENAI_SUFFIX="$(matched_host_suffix "${OPENAI_HOST}" \
       openai.azure.com \
       services.ai.azure.com \
-      cognitiveservices.azure.com >/dev/null
-    OPENAI_SAN_MATCH=exact
-    OPENAI_SAN_VALUE="${OPENAI_HOST}"
+      cognitiveservices.azure.com)"
+    OPENAI_SAN_MATCH=suffix
+    OPENAI_SAN_VALUE=".${AZURE_OPENAI_SUFFIX}"
     OPENAI_AZURE_TLS=1
     OPENAI_PATH_REWRITE=1
     OPENAI_AUTH_HEADER=api-key

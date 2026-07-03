@@ -777,10 +777,12 @@ static_resources:
               ## gm:openai-azure-tls-begin
               trusted_ca:
                 filename: /etc/gm/azure-roots.pem
+              # Azure serves wildcard DNS SANs. Match the configured Azure suffix here;
+              # exact SNI, pinned Azure roots, and attestd ARM binding keep resource scope.
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
-                    exact: __GM_OPENAI_SAN_VALUE__
+                    __GM_OPENAI_SAN_MATCH__: __GM_OPENAI_SAN_VALUE__
               ## gm:openai-azure-tls-end
 
     ## ── Chutes ────────────────────────────────────────────────────────
