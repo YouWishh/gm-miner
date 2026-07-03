@@ -5,6 +5,7 @@
 //! its listener and then periodically after binding; unsafe verification
 //! failures are fatal to keep the miner fail-closed.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::env::VarError;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ const DEFAULT_TRANSIENT_FAILURE_LIMIT: u32 = 3;
 const MIN_TRANSIENT_FAILURE_LIMIT: u32 = 1;
 const VERIFY_INTERVAL_ENV: &str = "GM_AZURE_VERIFY_INTERVAL_SECS";
 const TRANSIENT_FAILURE_LIMIT_ENV: &str = "GM_AZURE_VERIFY_TRANSIENT_FAILURE_LIMIT";
+const REQUIRE_ASYNC_FILTER_ENV: &str = "GM_AZURE_REQUIRE_ASYNC_FILTER";
 const AZURE_OPENAI_ALLOWED_SUFFIXES: [&str; 3] = [
     ".openai.azure.com",
     ".services.ai.azure.com",
@@ -46,6 +48,7 @@ struct AzureVerifyConfig {
     resource_group: String,
     client_id: String,
     client_secret: String,
+    require_async_filter: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +118,57 @@ struct DiagnosticLog {
     enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct ArmDeploymentList {
+    #[serde(default)]
+    value: Vec<ArmDeployment>,
+    #[serde(rename = "nextLink")]
+    next_link: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArmDeployment {
+    name: String,
+    #[serde(default)]
+    properties: ArmDeploymentProperties,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArmDeploymentProperties {
+    rai_policy_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArmRaiPolicy {
+    #[serde(default)]
+    properties: ArmRaiPolicyProperties,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ArmRaiPolicyProperties {
+    mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamingConfigAssessment {
+    deployment_count: usize,
+    checked_policy_count: usize,
+    violations: Vec<StreamingConfigViolation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamingConfigViolation {
+    MissingRaiPolicy {
+        deployment: String,
+    },
+    SynchronousMode {
+        policy: String,
+        mode: Option<String>,
+        deployments: Vec<String>,
+    },
+}
+
 #[derive(Debug, Error)]
 #[error("{label} request failed ({status}): {body}")]
 struct AzureHttpStatusError {
@@ -138,6 +192,7 @@ impl AzureVerifyConfig {
             resource_group: required_env("AZURE_RESOURCE_GROUP")?,
             client_id: required_env("AZURE_CLIENT_ID")?,
             client_secret: required_env("AZURE_CLIENT_SECRET")?,
+            require_async_filter: env_bool_default(REQUIRE_ASYNC_FILTER_ENV, true)?,
         })
     }
 }
@@ -226,6 +281,7 @@ async fn verify_azure_openai_config(config: &AzureVerifyConfig) -> Result<()> {
     let resource_id = assert_account_binding(&endpoint, &account)?;
     let diagnostics = fetch_diagnostic_settings(&client, resource_id, &token).await?;
     warn_on_unexpected_diagnostic_logs(&diagnostics);
+    verify_async_filter_configuration(&client, config, &endpoint, &token).await?;
     tracing::info!(
         azure_host = %endpoint.host,
         resource_id = %resource_id,
@@ -338,6 +394,18 @@ fn env_u32_at_least(name: &str, default: u32, minimum: u32) -> Result<u32> {
                 Ok(parsed)
             }
         }
+        Err(VarError::NotPresent) => Ok(default),
+        Err(err) => Err(err).with_context(|| format!("read {name}")),
+    }
+}
+
+fn env_bool_default(name: &str, default: bool) -> Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => bail!("{name} must be a boolean: true/false, 1/0, yes/no, or on/off"),
+        },
         Err(VarError::NotPresent) => Ok(default),
         Err(err) => Err(err).with_context(|| format!("read {name}")),
     }
@@ -463,6 +531,54 @@ async fn fetch_diagnostic_settings(
         "https://management.azure.com/{resource_path}/providers/Microsoft.Insights/diagnosticSettings?api-version={DIAGNOSTIC_SETTINGS_API_VERSION}",
     );
     get_json(client, &url, token, "Azure diagnostic settings").await
+}
+
+async fn fetch_arm_deployments(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    token: &str,
+) -> Result<ArmDeploymentList> {
+    let mut url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/deployments?api-version={ARM_API_VERSION}",
+        encode_path_segment(&config.subscription_id),
+        encode_path_segment(&config.resource_group),
+        encode_path_segment(&endpoint.account_name),
+    );
+    let mut deployments = Vec::new();
+    loop {
+        let page: ArmDeploymentList =
+            get_json(client, &url, token, "Azure OpenAI deployments").await?;
+        deployments.extend(page.value);
+        let Some(next_link) = page.next_link else {
+            break;
+        };
+        if next_link.trim().is_empty() {
+            bail!("Azure OpenAI deployments response had an empty nextLink");
+        }
+        url = next_link;
+    }
+    Ok(ArmDeploymentList {
+        value: deployments,
+        next_link: None,
+    })
+}
+
+async fn fetch_arm_rai_policy(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    policy_name: &str,
+    token: &str,
+) -> Result<ArmRaiPolicy> {
+    let url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/raiPolicies/{}?api-version={ARM_API_VERSION}",
+        encode_path_segment(&config.subscription_id),
+        encode_path_segment(&config.resource_group),
+        encode_path_segment(&endpoint.account_name),
+        encode_path_segment(policy_name),
+    );
+    get_json(client, &url, token, "Azure OpenAI RAI policy").await
 }
 
 async fn get_json<T: for<'de> Deserialize<'de>>(
@@ -606,6 +722,165 @@ fn diagnostic_log_is_allowed(log: &DiagnosticLog) -> bool {
             .is_some_and(|group| ALLOWED_DIAGNOSTIC_LOG_CATEGORY_GROUPS.contains(&group))
 }
 
+async fn verify_async_filter_configuration(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    token: &str,
+) -> Result<()> {
+    let deployments = fetch_arm_deployments(client, config, endpoint, token).await?;
+    tracing::info!(
+        deployment_count = deployments.value.len(),
+        "checking Azure OpenAI deployment streaming configuration",
+    );
+
+    let mut referenced_policy_names = BTreeSet::new();
+    for deployment in &deployments.value {
+        let rai_policy_name = deployment
+            .properties
+            .rai_policy_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty());
+        tracing::debug!(
+            deployment = %deployment.name,
+            rai_policy_name = rai_policy_name.unwrap_or("<missing>"),
+            "Azure OpenAI deployment RAI policy mapping",
+        );
+        if let Some(rai_policy_name) = rai_policy_name {
+            referenced_policy_names.insert(rai_policy_name.to_owned());
+        }
+    }
+
+    let mut policy_modes = BTreeMap::new();
+    for policy_name in referenced_policy_names {
+        let policy = fetch_arm_rai_policy(client, config, endpoint, &policy_name, token).await?;
+        tracing::debug!(
+            rai_policy_name = %policy_name,
+            mode = policy.properties.mode.as_deref().unwrap_or("<missing>"),
+            "Azure OpenAI RAI policy mode resolved",
+        );
+        policy_modes.insert(policy_name, policy.properties.mode);
+    }
+
+    let assessment = assess_streaming_configuration(&deployments, &policy_modes);
+    log_streaming_assessment(&assessment, config.require_async_filter)
+}
+
+fn assess_streaming_configuration(
+    deployments: &ArmDeploymentList,
+    policy_modes: &BTreeMap<String, Option<String>>,
+) -> StreamingConfigAssessment {
+    let mut deployments_by_policy = BTreeMap::<String, Vec<String>>::new();
+    let mut violations = Vec::new();
+
+    for deployment in &deployments.value {
+        let deployment_name = if deployment.name.trim().is_empty() {
+            "<unnamed>".to_owned()
+        } else {
+            deployment.name.clone()
+        };
+        match deployment
+            .properties
+            .rai_policy_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(policy_name) => {
+                deployments_by_policy
+                    .entry(policy_name.to_owned())
+                    .or_default()
+                    .push(deployment_name);
+            }
+            None => {
+                violations.push(StreamingConfigViolation::MissingRaiPolicy {
+                    deployment: deployment_name,
+                });
+            }
+        }
+    }
+
+    for (policy, deployments) in deployments_by_policy {
+        let mode = policy_modes.get(&policy).cloned().unwrap_or(None);
+        if !rai_policy_mode_allows_streaming(mode.as_deref()) {
+            violations.push(StreamingConfigViolation::SynchronousMode {
+                policy,
+                mode,
+                deployments,
+            });
+        }
+    }
+
+    StreamingConfigAssessment {
+        deployment_count: deployments.value.len(),
+        checked_policy_count: policy_modes.len(),
+        violations,
+    }
+}
+
+fn rai_policy_mode_allows_streaming(mode: Option<&str>) -> bool {
+    matches!(mode, Some("Asynchronous_filter" | "Deferred"))
+}
+
+fn log_streaming_assessment(
+    assessment: &StreamingConfigAssessment,
+    require_async_filter: bool,
+) -> Result<()> {
+    if assessment.deployment_count == 0 {
+        tracing::info!("no Azure OpenAI deployments to check for streaming configuration");
+        return Ok(());
+    }
+
+    if assessment.violations.is_empty() {
+        tracing::info!(
+            deployment_count = assessment.deployment_count,
+            rai_policy_count = assessment.checked_policy_count,
+            "streaming configuration verified: all referenced Azure OpenAI RAI policies use Asynchronous_filter or Deferred",
+        );
+        return Ok(());
+    }
+
+    let violation_messages = assessment
+        .violations
+        .iter()
+        .map(StreamingConfigViolation::message)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if require_async_filter {
+        tracing::error!(
+            violations = %violation_messages,
+            "Azure OpenAI streaming configuration failed",
+        );
+        bail!("Azure OpenAI streaming configuration failed: {violation_messages}");
+    }
+    tracing::warn!(
+        violations = %violation_messages,
+        "Azure OpenAI streaming configuration is not fully asynchronous; GM_AZURE_REQUIRE_ASYNC_FILTER=false so verification will continue",
+    );
+    Ok(())
+}
+
+impl StreamingConfigViolation {
+    fn message(&self) -> String {
+        match self {
+            Self::MissingRaiPolicy { deployment } => {
+                format!("deployment '{deployment}' has no properties.raiPolicyName")
+            }
+            Self::SynchronousMode {
+                policy,
+                mode,
+                deployments,
+            } => {
+                let mode = mode.as_deref().unwrap_or("<missing>");
+                format!(
+                    "deployment(s) '{}' reference RAI policy '{policy}' with synchronous mode '{mode}'",
+                    deployments.join(", ")
+                )
+            }
+        }
+    }
+}
+
 fn classify_verification_error(error: &anyhow::Error) -> VerificationFailureKind {
     for cause in error.chain() {
         if let Some(status_error) = cause.downcast_ref::<AzureHttpStatusError>() {
@@ -669,6 +944,14 @@ mod tests {
 
     fn account_from_json(json: &str) -> ArmAccount {
         serde_json::from_str(json).expect("fixture must parse")
+    }
+
+    fn deployments_from_json(json: &str) -> ArmDeploymentList {
+        serde_json::from_str(json).expect("deployment fixture must parse")
+    }
+
+    fn rai_policy_from_json(json: &str) -> ArmRaiPolicy {
+        serde_json::from_str(json).expect("RAI policy fixture must parse")
     }
 
     fn valid_account_json() -> &'static str {
@@ -854,6 +1137,143 @@ mod tests {
             enabled: true,
         };
         assert!(!diagnostic_log_is_allowed(&log));
+    }
+
+    #[test]
+    fn streaming_configuration_accepts_asynchronous_filter_mode() {
+        let deployments = deployments_from_json(
+            r#"{
+                "value": [{
+                    "name": "gpt-5",
+                    "properties": {"raiPolicyName": "async-policy"}
+                }]
+            }"#,
+        );
+        let policy = rai_policy_from_json(
+            r#"{
+                "properties": {"mode": "Asynchronous_filter"}
+            }"#,
+        );
+        let policy_modes = BTreeMap::from([("async-policy".to_owned(), policy.properties.mode)]);
+
+        let assessment = assess_streaming_configuration(&deployments, &policy_modes);
+        assert!(assessment.violations.is_empty(), "{assessment:?}");
+    }
+
+    #[test]
+    fn streaming_configuration_accepts_legacy_deferred_mode() {
+        let deployments = deployments_from_json(
+            r#"{
+                "value": [{
+                    "name": "gpt-5",
+                    "properties": {"raiPolicyName": "deferred-policy"}
+                }]
+            }"#,
+        );
+        let policy = rai_policy_from_json(
+            r#"{
+                "properties": {"mode": "Deferred"}
+            }"#,
+        );
+        let policy_modes = BTreeMap::from([("deferred-policy".to_owned(), policy.properties.mode)]);
+
+        let assessment = assess_streaming_configuration(&deployments, &policy_modes);
+        assert!(assessment.violations.is_empty(), "{assessment:?}");
+    }
+
+    #[test]
+    fn streaming_configuration_rejects_blocking_mode() {
+        let deployments = deployments_from_json(
+            r#"{
+                "value": [{
+                    "name": "gpt-5",
+                    "properties": {"raiPolicyName": "blocking-policy"}
+                }]
+            }"#,
+        );
+        let policy = rai_policy_from_json(
+            r#"{
+                "properties": {"mode": "Blocking"}
+            }"#,
+        );
+        let policy_modes = BTreeMap::from([("blocking-policy".to_owned(), policy.properties.mode)]);
+
+        let assessment = assess_streaming_configuration(&deployments, &policy_modes);
+        assert_eq!(
+            assessment.violations,
+            vec![StreamingConfigViolation::SynchronousMode {
+                policy: "blocking-policy".to_owned(),
+                mode: Some("Blocking".to_owned()),
+                deployments: vec!["gpt-5".to_owned()],
+            }]
+        );
+    }
+
+    #[test]
+    fn streaming_configuration_rejects_default_mode() {
+        let deployments = deployments_from_json(
+            r#"{
+                "value": [{
+                    "name": "gpt-5",
+                    "properties": {"raiPolicyName": "default-policy"}
+                }]
+            }"#,
+        );
+        let policy = rai_policy_from_json(
+            r#"{
+                "properties": {"mode": "Default"}
+            }"#,
+        );
+        let policy_modes = BTreeMap::from([("default-policy".to_owned(), policy.properties.mode)]);
+
+        let assessment = assess_streaming_configuration(&deployments, &policy_modes);
+        assert_eq!(
+            assessment.violations,
+            vec![StreamingConfigViolation::SynchronousMode {
+                policy: "default-policy".to_owned(),
+                mode: Some("Default".to_owned()),
+                deployments: vec!["gpt-5".to_owned()],
+            }]
+        );
+    }
+
+    #[test]
+    fn streaming_configuration_rejects_missing_mode() {
+        let deployments = deployments_from_json(
+            r#"{
+                "value": [{
+                    "name": "gpt-5",
+                    "properties": {"raiPolicyName": "missing-mode-policy"}
+                }]
+            }"#,
+        );
+        let policy = rai_policy_from_json(
+            r#"{
+                "properties": {}
+            }"#,
+        );
+        let policy_modes =
+            BTreeMap::from([("missing-mode-policy".to_owned(), policy.properties.mode)]);
+
+        let assessment = assess_streaming_configuration(&deployments, &policy_modes);
+        assert_eq!(
+            assessment.violations,
+            vec![StreamingConfigViolation::SynchronousMode {
+                policy: "missing-mode-policy".to_owned(),
+                mode: None,
+                deployments: vec!["gpt-5".to_owned()],
+            }]
+        );
+    }
+
+    #[test]
+    fn streaming_configuration_accepts_empty_deployments_list() {
+        let deployments = deployments_from_json(r#"{"value": []}"#);
+        let policy_modes = BTreeMap::new();
+
+        let assessment = assess_streaming_configuration(&deployments, &policy_modes);
+        assert_eq!(assessment.deployment_count, 0);
+        assert!(assessment.violations.is_empty(), "{assessment:?}");
     }
 
     #[test]

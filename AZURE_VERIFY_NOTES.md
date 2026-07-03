@@ -13,10 +13,20 @@ The gate fails closed if:
 - `properties.endpoint` does not use the same host as the configured Azure endpoint, including the configured allowed suffix.
 - `properties.raiMonitorConfig` is non-null.
 - `properties.userOwnedStorage` is non-null and non-empty.
+- Any deployment on the account references a Responsible AI policy whose `properties.mode` is not `Asynchronous_filter` or legacy `Deferred`. `Blocking`, `Default`, an absent mode, or a deployment with no `properties.raiPolicyName` is treated as synchronous buffering and fails closed by default.
+
+The streaming check uses the same scoped Entra credentials and ARM API version as the account binding check:
+
+- List deployments: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/deployments?api-version=2024-10-01`
+- Read each distinct referenced RAI policy: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/raiPolicies/{raiPolicyName}?api-version=2024-10-01`
+
+The verifier reads `value[].properties.raiPolicyName` from the deployment list, then reads `properties.mode` from each referenced RAI policy. Streaming is considered enabled only when the mode is `Asynchronous_filter` or `Deferred`. The verifier checks all deployments on the account so the attestation covers whatever the gateway may route to. If the account has zero deployments, the streaming check passes and logs that there are no deployments to check; model availability is gated elsewhere.
+
+`GM_AZURE_REQUIRE_ASYNC_FILTER` controls the posture for synchronous policies. It defaults to `true`, which fails the one-shot startup gate and periodic verification on any synchronous/buffering deployment. Set it to `false` only as an explicit break-glass override; synchronous deployments are then logged as warnings but do not fail verification. ARM read failures still use the normal transient-vs-definitive handling.
 
 Diagnostic settings are checked as defense in depth. Enabled native metadata categories are allowed: `Audit`, `RequestResponse`, `Trace`, `AzureOpenAIRequestUsage`; category groups `allLogs` and `audit` are allowed. Unknown enabled categories are logged as warnings, not fatal.
 
-After the startup gate passes and the listener binds, `attestd` re-runs the same Azure owner-capture verification periodically. The default interval is 900 seconds and can be overridden with `GM_AZURE_VERIFY_INTERVAL_SECS`; values below 60 seconds are clamped to 60 seconds. Transient verification errors such as Azure management/login network errors, timeouts, HTTP 408/429/5xx responses, or response decode failures are tolerated for 3 consecutive checks by default (`GM_AZURE_VERIFY_TRANSIENT_FAILURE_LIMIT`). A definitive verification failure, such as `raiMonitorConfig` becoming non-null, endpoint binding changing, account kind changing, or other policy mismatch, stops `attestd` immediately with a non-zero exit so the container restarts and the boot-time gate blocks serving.
+After the startup gate passes and the listener binds, `attestd` re-runs the same Azure owner-capture verification periodically, including the deployment streaming-mode check. The default interval is 900 seconds and can be overridden with `GM_AZURE_VERIFY_INTERVAL_SECS`; values below 60 seconds are clamped to 60 seconds. Transient verification errors such as Azure management/login network errors, timeouts, HTTP 408/429/5xx responses, or response decode failures are tolerated for 3 consecutive checks by default (`GM_AZURE_VERIFY_TRANSIENT_FAILURE_LIMIT`). A definitive verification failure, such as `raiMonitorConfig` becoming non-null, endpoint binding changing, account kind changing, async filtering being disabled, or other policy mismatch, stops `attestd` immediately with a non-zero exit so the container restarts and the boot-time gate blocks serving.
 
 Envoy also pins Azure upstream TLS to the baked Azure root bundle and exact DNS SAN for the configured Azure host. Direct `api.openai.com` keeps the system CA bundle and existing behavior.
 
@@ -34,6 +44,8 @@ Azure miners must provide:
 - `AZURE_CLIENT_SECRET`
 
 The Entra app/service principal should have `Reader` scoped to the Azure OpenAI resource so `attestd` can read the account and diagnostic settings without broader permissions.
+
+Azure deployments must use a content-filter RAI policy configured for asynchronous filtering. In ARM, this is the RAI policy `mode`, not a deployment-level `contentFilters` field. The deployment's `properties.raiPolicyName` must point to a policy whose `properties.mode` is `Asynchronous_filter` or `Deferred`; the default synchronous modes buffer completions under `stream:true` and are not allowed for gm Azure miners.
 
 ## Baked CA bundle
 
