@@ -90,6 +90,10 @@ COPY --from=builder /build/target/release/gm-miner-ratls /usr/local/bin/gm-miner
 ## Copy Envoy config.
 COPY image/envoy.yaml /etc/envoy/envoy.yaml
 
+## Azure OpenAI owner-capture verification: pin Envoy's Azure upstream
+## trust store to the roots measured into the image.
+COPY image/azure-roots.pem /etc/gm/azure-roots.pem
+
 ## Copy startup script.
 COPY image/start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh

@@ -99,6 +99,10 @@ parse_azure_host() {
       log "error: AZURE_OPENAI_ENDPOINT has unsupported URL scheme"
       exit 1
       ;;
+    *)
+      log "error: AZURE_OPENAI_ENDPOINT must use https"
+      exit 1
+      ;;
   esac
   rest="${rest%%/*}"
   rest="${rest%%\?*}"
@@ -167,6 +171,7 @@ OPENAI_AUTH_HEADER=authorization
 OPENAI_AUTH_VALUE="Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
 OPENAI_SAN_MATCH=exact
 OPENAI_SAN_VALUE="${OPENAI_HOST}"
+OPENAI_AZURE_TLS=0
 
 case "${OPENAI_UPSTREAM}" in
   direct) ;;
@@ -185,13 +190,13 @@ case "${OPENAI_UPSTREAM}" in
       openai.azure.com \
       services.ai.azure.com \
       cognitiveservices.azure.com
-    OPENAI_SAN_MATCH=suffix
-    OPENAI_SAN_VALUE=".$(
-      matched_host_suffix "${OPENAI_HOST}" \
-        openai.azure.com \
-        services.ai.azure.com \
-        cognitiveservices.azure.com
-    )"
+    matched_host_suffix "${OPENAI_HOST}" \
+      openai.azure.com \
+      services.ai.azure.com \
+      cognitiveservices.azure.com >/dev/null
+    OPENAI_SAN_MATCH=exact
+    OPENAI_SAN_VALUE="${OPENAI_HOST}"
+    OPENAI_AZURE_TLS=1
     OPENAI_PATH_REWRITE=1
     OPENAI_AUTH_HEADER=api-key
     OPENAI_AUTH_VALUE="%ENVIRONMENT(AZURE_OPENAI_API_KEY)%"
@@ -327,6 +332,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_OPENAI_AUTH_VALUE="${OPENAI_AUTH_VALUE}" \
   GM_OPENAI_SAN_MATCH="${OPENAI_SAN_MATCH}" \
   GM_OPENAI_SAN_VALUE="${OPENAI_SAN_VALUE}" \
+  GM_OPENAI_AZURE_TLS="${OPENAI_AZURE_TLS}" \
   awk '
   function subst(line, token, value,    out, rest, pos) {
     out = ""
@@ -357,6 +363,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     openai_auth_value = ENVIRON["GM_OPENAI_AUTH_VALUE"]
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
+    openai_azure_tls = (ENVIRON["GM_OPENAI_AZURE_TLS"] == "1")
   }
   /^[[:space:]]*## gm:benchmark-tls-begin[[:space:]]*$/ { in_tls = 1; next }
   /^[[:space:]]*## gm:benchmark-tls-end[[:space:]]*$/   { in_tls = 0; next }
@@ -367,6 +374,12 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   /^[[:space:]]*## gm:openai-path-rewrite-begin[[:space:]]*$/ { in_openai_path_rewrite = 1; next }
   /^[[:space:]]*## gm:openai-path-rewrite-end[[:space:]]*$/   { in_openai_path_rewrite = 0; next }
   in_openai_path_rewrite && !openai_path_rewrite { next }
+  /^[[:space:]]*## gm:openai-system-tls-begin[[:space:]]*$/ { in_openai_system_tls = 1; next }
+  /^[[:space:]]*## gm:openai-system-tls-end[[:space:]]*$/   { in_openai_system_tls = 0; next }
+  in_openai_system_tls && openai_azure_tls { next }
+  /^[[:space:]]*## gm:openai-azure-tls-begin[[:space:]]*$/ { in_openai_azure_tls = 1; next }
+  /^[[:space:]]*## gm:openai-azure-tls-end[[:space:]]*$/   { in_openai_azure_tls = 0; next }
+  in_openai_azure_tls && !openai_azure_tls { next }
   {
     line = subst($0, "__GM_NODE_SECRET__", secret)
     line = subst(line, "__GM_BENCHMARK_HOST__", bench_host)

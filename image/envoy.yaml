@@ -766,12 +766,22 @@ static_resources:
           sni: __GM_OPENAI_HOST__
           common_tls_context:
             validation_context:
+              ## gm:openai-system-tls-begin
               trusted_ca:
                 filename: /etc/ssl/certs/ca-certificates.crt
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
                     __GM_OPENAI_SAN_MATCH__: __GM_OPENAI_SAN_VALUE__
+              ## gm:openai-system-tls-end
+              ## gm:openai-azure-tls-begin
+              trusted_ca:
+                filename: /etc/gm/azure-roots.pem
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: __GM_OPENAI_SAN_VALUE__
+              ## gm:openai-azure-tls-end
 
     ## ── Chutes ────────────────────────────────────────────────────────
     - name: chutes

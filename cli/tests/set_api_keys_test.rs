@@ -351,17 +351,24 @@ fn validate_upstreams_rejects_incomplete_azure() {
 
 #[test]
 fn validate_upstreams_rejects_non_https_azure_endpoint() {
-    let keys = ProviderKeys {
-        openai_upstream: Some("azure".to_owned()),
-        azure_openai_endpoint: Some("http://r.openai.azure.com".to_owned()),
-        azure_openai_api_key: Some("k".to_owned()),
-        ..ProviderKeys::default()
-    };
-    let err = keys.validate_upstreams().unwrap_err().to_string();
-    assert!(
-        err.contains("--azure-openai-endpoint must use https"),
-        "{err}"
-    );
+    for endpoint in ["http://r.openai.azure.com", "r.openai.azure.com"] {
+        let keys = ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            azure_openai_endpoint: Some(endpoint.to_owned()),
+            azure_openai_api_key: Some("k".to_owned()),
+            azure_tenant_id: Some("tenant".to_owned()),
+            azure_subscription_id: Some("sub".to_owned()),
+            azure_resource_group: Some("rg".to_owned()),
+            azure_client_id: Some("client".to_owned()),
+            azure_client_secret: Some("secret".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let err = keys.validate_upstreams().unwrap_err().to_string();
+        assert!(
+            err.contains("--azure-openai-endpoint must use https"),
+            "{err}"
+        );
+    }
 }
 
 #[test]
@@ -370,6 +377,11 @@ fn validate_upstreams_rejects_non_allowed_azure_endpoint() {
         openai_upstream: Some("azure".to_owned()),
         azure_openai_endpoint: Some("https://api.evil.example".to_owned()),
         azure_openai_api_key: Some("k".to_owned()),
+        azure_tenant_id: Some("tenant".to_owned()),
+        azure_subscription_id: Some("sub".to_owned()),
+        azure_resource_group: Some("rg".to_owned()),
+        azure_client_id: Some("client".to_owned()),
+        azure_client_secret: Some("secret".to_owned()),
         ..ProviderKeys::default()
     };
     let err = keys.validate_upstreams().unwrap_err().to_string();
@@ -388,6 +400,11 @@ fn validate_upstreams_accepts_complete_cloud_and_direct() {
         openai_upstream: Some("azure".to_owned()),
         azure_openai_endpoint: Some("https://r.openai.azure.com".to_owned()),
         azure_openai_api_key: Some("k".to_owned()),
+        azure_tenant_id: Some("tenant".to_owned()),
+        azure_subscription_id: Some("sub".to_owned()),
+        azure_resource_group: Some("rg".to_owned()),
+        azure_client_id: Some("client".to_owned()),
+        azure_client_secret: Some("secret".to_owned()),
         ..ProviderKeys::default()
     };
     assert!(complete.validate_upstreams().is_ok());

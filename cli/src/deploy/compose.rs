@@ -62,6 +62,20 @@ pub fn render_env_file(
             "AZURE_OPENAI_API_KEY",
             env_vars.azure_openai_api_key.as_deref(),
         ),
+        ("AZURE_TENANT_ID", env_vars.azure_tenant_id.as_deref()),
+        (
+            "AZURE_SUBSCRIPTION_ID",
+            env_vars.azure_subscription_id.as_deref(),
+        ),
+        (
+            "AZURE_RESOURCE_GROUP",
+            env_vars.azure_resource_group.as_deref(),
+        ),
+        ("AZURE_CLIENT_ID", env_vars.azure_client_id.as_deref()),
+        (
+            "AZURE_CLIENT_SECRET",
+            env_vars.azure_client_secret.as_deref(),
+        ),
         ("GOOGLE_API_KEY", env_vars.google.as_deref()),
         ("CHUTES_API_KEY", env_vars.chutes.as_deref()),
     ] {
@@ -337,6 +351,11 @@ mod tests {
                 "OPENAI_UPSTREAM",
                 "AZURE_OPENAI_ENDPOINT",
                 "AZURE_OPENAI_API_KEY",
+                "AZURE_TENANT_ID",
+                "AZURE_SUBSCRIPTION_ID",
+                "AZURE_RESOURCE_GROUP",
+                "AZURE_CLIENT_ID",
+                "AZURE_CLIENT_SECRET",
                 "GOOGLE_API_KEY",
                 "CHUTES_API_KEY",
                 "GM_NODE_SECRET",

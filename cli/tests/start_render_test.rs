@@ -101,8 +101,9 @@ fn bedrock_and_azure_render_cloud_upstreams() {
 
     assert!(rendered.contains("host_rewrite_literal: gm-resource.openai.azure.com"));
     assert!(rendered.contains("address: gm-resource.openai.azure.com"));
-    assert!(rendered.contains("suffix: .openai.azure.com"));
-    assert!(!rendered.contains("exact: gm-resource.openai.azure.com"));
+    assert!(rendered.contains("filename: /etc/gm/azure-roots.pem"));
+    assert!(rendered.contains("exact: gm-resource.openai.azure.com"));
+    assert!(!rendered.contains("suffix: .openai.azure.com"));
     assert!(rendered.contains("substitution: \"/openai/v1/chat/completions\""));
     assert!(rendered.contains("key: api-key"));
     assert!(rendered.contains("value: \"%ENVIRONMENT(AZURE_OPENAI_API_KEY)%\""));

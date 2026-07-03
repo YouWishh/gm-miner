@@ -328,6 +328,11 @@ fn wizard_provider_keys(
             keys.openai_upstream,
             keys.azure_openai_endpoint,
             keys.azure_openai_api_key,
+            keys.azure_tenant_id,
+            keys.azure_subscription_id,
+            keys.azure_resource_group,
+            keys.azure_client_id,
+            keys.azure_client_secret,
             keys.google,
             keys.chutes,
         )
@@ -345,6 +350,11 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         openai_upstream: None,
         azure_openai_endpoint: None,
         azure_openai_api_key: None,
+        azure_tenant_id: None,
+        azure_subscription_id: None,
+        azure_resource_group: None,
+        azure_client_id: None,
+        azure_client_secret: None,
         google: prompt_line("Google API key (blank to skip):", assume_yes)?,
         chutes: prompt_line("Chutes API key (blank to skip):", assume_yes)?,
     })

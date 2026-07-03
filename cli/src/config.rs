@@ -332,6 +332,16 @@ pub struct ProviderKeys {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub azure_openai_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_tenant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_subscription_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_resource_group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub google: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chutes: Option<String>,
@@ -399,14 +409,14 @@ fn host_allowed_by_suffix(host: &str, suffix: &str) -> bool {
 }
 
 fn validate_azure_openai_endpoint(endpoint: &str) -> Result<()> {
-    let mut rest = endpoint;
-    if let Some(stripped) = endpoint.strip_prefix("https://") {
-        rest = stripped;
-    } else if endpoint.starts_with("http://") {
-        anyhow::bail!("--azure-openai-endpoint must use https when a scheme is provided");
-    } else if endpoint.contains("://") {
-        anyhow::bail!("--azure-openai-endpoint has unsupported URL scheme");
-    }
+    let Some(rest) = endpoint.strip_prefix("https://") else {
+        if endpoint.starts_with("http://") {
+            anyhow::bail!("--azure-openai-endpoint must use https");
+        } else if endpoint.contains("://") {
+            anyhow::bail!("--azure-openai-endpoint has unsupported URL scheme");
+        }
+        anyhow::bail!("--azure-openai-endpoint must use https");
+    };
 
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.contains('@') {
@@ -484,6 +494,17 @@ impl ProviderKeys {
                             "--azure-openai-api-key",
                             self.azure_openai_api_key.as_deref(),
                         ),
+                        ("--azure-tenant-id", self.azure_tenant_id.as_deref()),
+                        (
+                            "--azure-subscription-id",
+                            self.azure_subscription_id.as_deref(),
+                        ),
+                        (
+                            "--azure-resource-group",
+                            self.azure_resource_group.as_deref(),
+                        ),
+                        ("--azure-client-id", self.azure_client_id.as_deref()),
+                        ("--azure-client-secret", self.azure_client_secret.as_deref()),
                     ],
                 )?;
                 validate_azure_openai_endpoint(

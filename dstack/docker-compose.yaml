@@ -78,6 +78,11 @@ services:
       - OPENAI_UPSTREAM
       - AZURE_OPENAI_ENDPOINT
       - AZURE_OPENAI_API_KEY
+      - AZURE_TENANT_ID
+      - AZURE_SUBSCRIPTION_ID
+      - AZURE_RESOURCE_GROUP
+      - AZURE_CLIENT_ID
+      - AZURE_CLIENT_SECRET
       - GOOGLE_API_KEY
       - CHUTES_API_KEY
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.

@@ -41,6 +41,11 @@ pub(crate) fn cmd_set_api_keys(
     openai_upstream: Option<String>,
     azure_openai_endpoint: Option<String>,
     azure_openai_api_key: Option<String>,
+    azure_tenant_id: Option<String>,
+    azure_subscription_id: Option<String>,
+    azure_resource_group: Option<String>,
+    azure_client_id: Option<String>,
+    azure_client_secret: Option<String>,
     google: Option<String>,
     chutes: Option<String>,
 ) -> Result<()> {
@@ -68,6 +73,21 @@ pub(crate) fn cmd_set_api_keys(
     }
     if let Some(ref k) = azure_openai_api_key {
         validate_key("azure-openai-api-key", k)?;
+    }
+    if let Some(ref v) = azure_tenant_id {
+        validate_key("azure-tenant-id", v)?;
+    }
+    if let Some(ref v) = azure_subscription_id {
+        validate_key("azure-subscription-id", v)?;
+    }
+    if let Some(ref v) = azure_resource_group {
+        validate_key("azure-resource-group", v)?;
+    }
+    if let Some(ref v) = azure_client_id {
+        validate_key("azure-client-id", v)?;
+    }
+    if let Some(ref v) = azure_client_secret {
+        validate_key("azure-client-secret", v)?;
     }
     if let Some(ref k) = google {
         validate_key("google", k)?;
@@ -116,6 +136,21 @@ pub(crate) fn cmd_set_api_keys(
             if let Some(k) = azure_openai_api_key {
                 keys.azure_openai_api_key = Some(k);
             }
+            if let Some(v) = azure_tenant_id {
+                keys.azure_tenant_id = Some(v);
+            }
+            if let Some(v) = azure_subscription_id {
+                keys.azure_subscription_id = Some(v);
+            }
+            if let Some(v) = azure_resource_group {
+                keys.azure_resource_group = Some(v);
+            }
+            if let Some(v) = azure_client_id {
+                keys.azure_client_id = Some(v);
+            }
+            if let Some(v) = azure_client_secret {
+                keys.azure_client_secret = Some(v);
+            }
             if let Some(k) = google {
                 keys.google = Some(k);
             }
@@ -126,7 +161,13 @@ pub(crate) fn cmd_set_api_keys(
                 keys.anthropic.is_some(),
                 keys.bedrock_api_key.is_some(),
                 keys.openai.is_some(),
-                keys.azure_openai_api_key.is_some(),
+                keys.azure_openai_api_key.is_some()
+                    || keys.azure_openai_endpoint.is_some()
+                    || keys.azure_tenant_id.is_some()
+                    || keys.azure_subscription_id.is_some()
+                    || keys.azure_resource_group.is_some()
+                    || keys.azure_client_id.is_some()
+                    || keys.azure_client_secret.is_some(),
                 keys.google.is_some(),
                 keys.chutes.is_some(),
             );
