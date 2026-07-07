@@ -133,6 +133,12 @@ pub struct WorkerRecord {
     /// relabeling from whatever global config is current later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// The provider slot ids advertised at deploy time, derived from the
+    /// keys baked into this CVM. Stored per worker so `register-image`
+    /// recovery re-sends what the worker actually holds instead of
+    /// re-deriving from whatever local keys are current later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_slots: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// Set on a *provisional* record (empty `worker_id`) that a `worker add`
     /// wrote before its registry POST — i.e. an in-flight or failed secondary
     /// worker. It keeps that stub off the worker-#1 registration paths
@@ -454,6 +460,7 @@ impl ProviderKeys {
     /// unknown value, or when a selected `bedrock`/`azure` upstream is missing
     /// a required field.
     pub fn validate_upstreams(&self) -> Result<()> {
+        crate::slots::validate_cloud_backend_single_keys(self)?;
         match self.anthropic_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
             "bedrock" => {
