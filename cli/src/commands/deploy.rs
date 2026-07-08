@@ -16,10 +16,10 @@ use gm_miner_cli::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
         parse_phala_cvm_endpoint, parse_phala_cvm_name, preflight_phala_cli, prepare_deploy_target,
         resolve_image_source, resolve_registry_credentials, select_version,
-        to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner, ImageSource, PhalaClient,
-        PHALA_ENDPOINT_FIELD,
+        to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner, ImageSource, ImageVersion,
+        PhalaClient, PHALA_ENDPOINT_FIELD,
     },
-    node_secret, terms,
+    node_secret, slots, terms,
     types::{MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse},
 };
 
@@ -27,6 +27,7 @@ use crate::commands::persist::{
     persist_accepted_terms, persist_worker_record, remove_provisional_worker,
 };
 use crate::commands::status_error;
+use crate::commands::streaming_check::deploy_streaming_advisory;
 use crate::{DeployFlags, PublishImageVersionFlags};
 
 /// Parsed `gmcli deploy` arguments, grouped so the dispatch match arm
@@ -341,6 +342,35 @@ async fn phala_preflight(args: &DeployArgs) -> Result<Option<String>> {
     gm_miner_cli::phala::resolve_key(args.phala_api_key.as_deref(), args.assume_yes).await
 }
 
+/// Whether the deploy target is a slot-capable image.
+///
+/// Capability comes from the registry rows' publish-time feature stamps:
+/// the selected approved row on the default path, or — when the operator
+/// passes an explicit `--image-ref` — whichever approved row published
+/// that exact digest. An image the registry cannot vouch for (an unknown
+/// ref, or any `--image-repo` build) is treated as legacy: slots are
+/// never advertised for an entrypoint without a stamped row, which also
+/// keeps a multi-key env from ever reaching a CVM that cannot parse it.
+fn image_is_slot_capable(
+    args: &DeployArgs,
+    approved: &ImageVersion,
+    versions: &[ImageVersion],
+) -> bool {
+    // Mirrors `resolve_image_source` precedence exactly: an explicit
+    // --image-ref wins over --image-repo, which wins over the approved
+    // row's default ref. The capability verdict must describe the image
+    // that actually deploys.
+    if let Some(explicit) = args.image_ref.as_deref() {
+        return versions
+            .iter()
+            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.slot_capable());
+    }
+    if args.image_repo.is_some() {
+        return false;
+    }
+    approved.slot_capable()
+}
+
 /// Resolve the image source (default = the gm-published `supported_image_ref`,
 /// overridden by `--image-ref`, built locally for `--image-repo`), provision
 /// it, and render the compose template around the resulting digest-pinned ref.
@@ -420,43 +450,6 @@ pub(crate) async fn cmd_deploy(
     // stores all stay in lockstep (Mechanism 1 of attestation-and-identity.md).
     // Only worker #1 (`deploy`) may inherit a pre-multi-worker legacy
     // secret; a `worker add` must always mint its own.
-    let is_first = *registration == WorkerRegistration::First;
-    // A provisional stub from a `worker add` must stay off the worker-#1
-    // registration paths even before it has a worker_id; tag it so the
-    // primary/secondary classifiers can tell it from a worker-#1 stub.
-    let provisional_secondary = !is_first;
-    // Redeploying a worker already registered under this `--app-name` keeps
-    // its registry `worker_id`: the upcoming registration returns the same id.
-    // Carrying it into the pre-registration stubs means a deploy that fails
-    // after the CVM exists does not erase the worker_id — `worker remove` can
-    // still issue the registry DELETE for the still-registered worker.
-    let existing_worker_id = existing_worker_id_for(cfg, &args.app_name);
-    let (node_secret, freshly_generated) =
-        node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
-    if freshly_generated {
-        println!(
-            "Generated a fresh node secret for worker '{}'.",
-            args.app_name
-        );
-        // Persist the secret before the CVM launches. If the deploy or the
-        // registry call later fails, the running envoy enforces this secret
-        // and a re-deploy with the same `--app-name` recovers it (matched on
-        // app_name); without this, a fresh secret would exist only in memory
-        // until step 9. The worker_id/app_id are filled in once Phala and the
-        // registry return — step 9 upserts this same record in place.
-        persist_worker_record(
-            cfg.active_network(),
-            WorkerRecord {
-                worker_id: existing_worker_id.clone(),
-                app_id: String::new(),
-                app_name: args.app_name.clone(),
-                node_secret: node_secret.clone(),
-                backend: worker_backend.clone(),
-                provisional_secondary,
-            },
-        )?;
-    }
-
     // The Phala CLI + API-key gate already ran in `cmd_deploy_subcommand`,
     // which scoped the validated key onto the `phala` client. The `phala`
     // client passed in here carries it.
@@ -480,6 +473,54 @@ pub(crate) async fn cmd_deploy(
         approved.notes.as_deref().unwrap_or("<no notes>"),
         format_created_at(&approved.created_at),
     );
+
+    let is_first = *registration == WorkerRegistration::First;
+    // A provisional stub from a `worker add` must stay off the worker-#1
+    // registration paths even before it has a worker_id; tag it so the
+    // primary/secondary classifiers can tell it from a worker-#1 stub.
+    let provisional_secondary = !is_first;
+    // Redeploying a worker already registered under this `--app-name` keeps
+    // its registry `worker_id`: the upcoming registration returns the same id.
+    // Carrying it into the pre-registration stubs means a deploy that fails
+    // after the CVM exists does not erase the worker_id — `worker remove` can
+    // still issue the registry DELETE for the still-registered worker.
+    let existing_worker_id = existing_worker_id_for(cfg, &args.app_name);
+    let (node_secret, freshly_generated) =
+        node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
+    let provider_slots = if image_is_slot_capable(args, approved, &versions) {
+        slots::provider_slots_for_keys(keys, &node_secret)?
+    } else {
+        // The target image's entrypoint predates slots: it cannot fan out
+        // multi-key values or honor x-gm-upstream-slot. Refuse multi-key
+        // configs before any CVM launches, and advertise nothing so the
+        // worker registers as legacy.
+        slots::reject_multikey_for_legacy_image(keys)?;
+        std::collections::BTreeMap::new()
+    };
+    if freshly_generated {
+        println!(
+            "Generated a fresh node secret for worker '{}'.",
+            args.app_name
+        );
+        // Persist the secret before the CVM launches. If the deploy or the
+        // registry call later fails, the running envoy enforces this secret
+        // and a re-deploy with the same `--app-name` recovers it (matched on
+        // app_name); without this, a fresh secret would exist only in memory
+        // until step 9. The worker_id/app_id are filled in once Phala and the
+        // registry return — step 9 upserts this same record in place.
+        persist_worker_record(
+            cfg.active_network(),
+            WorkerRecord {
+                worker_id: existing_worker_id.clone(),
+                app_id: String::new(),
+                app_name: args.app_name.clone(),
+                node_secret: node_secret.clone(),
+                backend: worker_backend.clone(),
+                provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
+                provisional_secondary,
+            },
+        )?;
+    }
 
     // Step 5: resolve which image to deploy (default = the gm-published ref
     // on the selected version) and render the compose around it.
@@ -526,6 +567,7 @@ pub(crate) async fn cmd_deploy(
             app_name: args.app_name.clone(),
             node_secret: node_secret.clone(),
             backend: worker_backend.clone(),
+            provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
             provisional_secondary,
         },
     )?;
@@ -552,6 +594,7 @@ pub(crate) async fn cmd_deploy(
             endpoint: &actual.endpoint,
             node_secret: Some(&node_secret),
             backend: worker_backend.as_deref(),
+            provider_slots: (!provider_slots.is_empty()).then_some(&provider_slots),
             accepted_terms_version: Some(terms::CURRENT_TERMS_VERSION),
         },
     )
@@ -568,14 +611,16 @@ pub(crate) async fn cmd_deploy(
             worker_id: worker_id.clone(),
             app_id: actual.app_id.clone(),
             app_name: args.app_name.clone(),
-            node_secret,
+            node_secret: node_secret.clone(),
             backend: worker_backend,
+            provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
             // Registered: role is read from position, never this flag.
             provisional_secondary: false,
         },
     )?;
 
     print_deploy_summary(&worker_id, &actual.app_id, registration);
+    deploy_streaming_advisory(cfg, &actual.endpoint, &node_secret).await;
     Ok(())
 }
 
@@ -620,7 +665,7 @@ async fn register_worker(
 }
 
 /// Fetch the calling miner's hotkey from `GET /miners/me`.
-async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> {
+pub(crate) async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> {
     let resp = client
         .get(gm_miner_cli::client::ME_PATH)
         .await
@@ -663,6 +708,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
         node_secret,
         existing_app_name,
         backend: register_backend,
+        provider_slots,
     } = register_image_context(&cfg, app_id)?;
     let network = cfg.active_network().to_owned();
     // Scope the same Phala key deploy would use (env or saved config key) onto
@@ -737,6 +783,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
             // whatever global config is current later. If no local record
             // exists, current config is only a best-effort fallback.
             backend: register_backend.as_deref(),
+            provider_slots: provider_slots.as_ref(),
             // A register-image resync re-asserts the image, not the terms; the
             // registry keeps whatever acceptance the first deploy recorded.
             accepted_terms_version: None,
@@ -763,6 +810,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
                 app_name,
                 node_secret: secret,
                 backend: register_backend,
+                provider_slots: provider_slots.clone(),
                 provisional_secondary: false,
             },
         )?;
@@ -786,6 +834,7 @@ struct RegisterImageContext {
     node_secret: Option<String>,
     existing_app_name: Option<String>,
     backend: Option<String>,
+    provider_slots: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 fn register_image_context(cfg: &Config, app_id: &str) -> Result<RegisterImageContext> {
@@ -821,10 +870,17 @@ fn register_image_context(cfg: &Config, app_id: &str) -> Result<RegisterImageCon
             .and_then(config::NetworkEntry::legacy_node_secret)
             .map(str::to_owned)
     });
+    // Re-send the slot ids recorded at deploy time, never a re-derivation
+    // from current config: local keys may have changed since this CVM was
+    // deployed, and advertising slots the worker does not hold turns every
+    // slot-routed request into a 421. An untracked CVM has no record, so it
+    // re-registers unslotted until a proper deploy.
+    let provider_slots = tracked.and_then(|w| w.provider_slots.clone());
     Ok(RegisterImageContext {
         node_secret,
         existing_app_name: tracked.map(|w| w.app_name.clone()),
         backend: register_image_backend(tracked, cfg),
+        provider_slots,
     })
 }
 
@@ -894,6 +950,8 @@ struct WorkerImageArgs<'a> {
     node_secret: Option<&'a str>,
     /// Worker provenance derived from configured upstream selectors.
     backend: Option<&'a str>,
+    /// Direct-upstream provider slot ids advertised to the registry.
+    provider_slots: Option<&'a std::collections::BTreeMap<String, Vec<String>>>,
     /// The gm-miner-terms version the operator accepted, sent on the
     /// first-worker registration so the registry records it on the miner row.
     /// `None` omits the field — the registry leaves any stored value untouched
@@ -920,6 +978,7 @@ async fn post_register_image(
         os_image_hash: args.os_image_hash,
         node_secret: args.node_secret,
         backend: args.backend,
+        provider_slots: args.provider_slots,
     })
     .context("serialize register body")?;
     // The accepted terms version, recorded on the miner row keyed to hotkey —
@@ -975,6 +1034,7 @@ async fn post_add_worker(
         os_image_hash: args.os_image_hash,
         node_secret: args.node_secret,
         backend: args.backend,
+        provider_slots: args.provider_slots,
     })
     .context("serialize worker-add body")?;
 
@@ -1147,6 +1207,7 @@ mod tests {
             os_image_hash: "b".repeat(64).as_str(),
             node_secret: Some("secret"),
             backend: backend.as_deref(),
+            provider_slots: None,
         })
         .expect("serialize register-image request");
         assert_eq!(body["backend"], "bedrock");

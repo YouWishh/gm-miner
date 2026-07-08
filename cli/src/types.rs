@@ -8,6 +8,8 @@
 //! * `GET /products`  → `ProductCatalogResponse`.
 //! * `GET /miners/me` → `MinerStatusResponse`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Provider identifier — must match the canonical enum in product.json.
@@ -135,6 +137,13 @@ pub struct ProductOfferStatus {
     pub is_offered: bool,
     pub is_eligible: bool,
     pub discount_bp: Option<u32>,
+    /// Upstream deployment/model id the miner declared for a cloud-backed
+    /// offer (Azure/Bedrock). Absent for direct upstreams, where the
+    /// canonical [`model`](Self::model) is sent verbatim. The registry marks
+    /// the field nullable, so `#[serde(default)]` keeps decode working
+    /// against a registry build that predates emitting it.
+    #[serde(default)]
+    pub upstream_model: Option<String>,
 }
 
 /// Body of `POST /miners/products` (`ProductDeclarationRequest`).
@@ -169,6 +178,8 @@ pub struct WorkerCreateRequest<'a> {
     pub node_secret: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_slots: Option<&'a BTreeMap<String, Vec<String>>>,
 }
 
 /// Response from `POST /miners/{hotkey}/workers` (`WorkerCreateResponse`).

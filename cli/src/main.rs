@@ -58,6 +58,7 @@ use crate::commands::hotkey::cmd_register_hotkey;
 use crate::commands::keys::cmd_set_api_keys;
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::products::{cmd_declare_product, cmd_declare_products, cmd_status};
+use crate::commands::streaming_check::cmd_check_streaming;
 use crate::commands::wizard::cmd_init;
 
 // Re-exports so the in-file `mod tests` block can keep reaching items it moved
@@ -269,6 +270,18 @@ enum Command {
         flags: Box<PublishImageVersionFlags>,
     },
 
+    /// Render upstream key slot exports for the container entrypoint.
+    #[command(hide = true)]
+    SlotEnv {
+        /// Provider id: anthropic, openai, gemini, or chutes.
+        #[arg(long)]
+        provider: Provider,
+
+        /// Name of the environment variable holding the semicolon-separated keys.
+        #[arg(long = "env-var")]
+        env_var: String,
+    },
+
     /// Alias for `status` — the product table is folded into `status`.
     ///
     /// Kept so existing muscle memory and scripts keep working; it runs the
@@ -286,6 +299,17 @@ enum Command {
         gmcli doctor\n  \
         gmcli --network testnet doctor")]
     Doctor,
+
+    /// Check whether the deployed miner streams tokens or buffers upstream output.
+    ///
+    /// Sends one tiny streaming inference request per configured provider
+    /// through the miner's own data plane using the stored worker node secret.
+    /// Buffered output usually means Azure `OpenAI`'s synchronous content filter
+    /// is delaying token delivery.
+    #[command(after_help = "Examples:\n  \
+        gmcli check-streaming\n  \
+        gmcli --network testnet check-streaming")]
+    CheckStreaming,
 
     /// Record the hotkey your miner serves under.
     ///
@@ -665,6 +689,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = load_config(explicit_network, api_url)?;
             cmd_doctor(cfg).await
         }
+        Command::CheckStreaming => {
+            let cfg = load_config(explicit_network, api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
+            cmd_check_streaming(cfg).await
+        }
         Command::RegisterHotkey {
             hotkey_ss58,
             wallet,
@@ -685,6 +714,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = load_config(explicit_network, api_url)?;
             cmd_publish_image_version(&cfg, *flags).await
         }
+        Command::SlotEnv { provider, env_var } => cmd_slot_env(&provider, &env_var),
         Command::ListProducts | Command::Status => {
             let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
@@ -723,6 +753,22 @@ async fn dispatch(cli: Cli) -> Result<()> {
             cmd_declare_products(&mut client, provider.as_ref(), discount_bp).await
         }
     }
+}
+
+fn cmd_slot_env(provider: &Provider, env_var: &str) -> Result<()> {
+    if matches!(provider, Provider::Benchmark) {
+        anyhow::bail!("benchmark does not use upstream key slots");
+    }
+    let node_secret = gm_miner_cli::deploy::non_empty_env("GM_NODE_SECRET").ok_or_else(|| {
+        anyhow::anyhow!("GM_NODE_SECRET must be set to derive upstream key slots")
+    })?;
+    let raw = gm_miner_cli::deploy::non_empty_env(env_var)
+        .ok_or_else(|| anyhow::anyhow!("{env_var} must be set to derive upstream key slots"))?;
+    print!(
+        "{}",
+        gm_miner_cli::slots::render_slot_env_exports(provider.as_str(), &raw, &node_secret)?
+    );
+    Ok(())
 }
 
 /// Route the `worker` subcommands. Each loads config, refreshes the token,

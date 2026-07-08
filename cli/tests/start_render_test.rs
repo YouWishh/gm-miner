@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "f3abbddee646ad2a6684ae7a160312cc215156f5c34d8ca4c4ca134f896fd6fc";
+    "f4f575f419d99d9756f08a5218b39d7f18e14ee4ff581d1e587e94237aaae708";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -34,6 +34,7 @@ where
         .env_clear()
         .env("PATH", "/bin:/usr/bin:/usr/local/bin")
         .env("GM_START_RENDER_ONLY", "1")
+        .env("GMCLI_BIN", env!("CARGO_BIN_EXE_gmcli"))
         .env("GM_ENVOY_TEMPLATE_PATH", root.join("image/envoy.yaml"))
         .env("GM_RENDERED_CONFIG", out.path())
         .env("GM_NETWORK", "testnet")
@@ -51,17 +52,20 @@ where
 }
 
 #[test]
-fn direct_unset_render_matches_pre_cloud_output_byte_for_byte() {
+fn direct_unset_render_matches_pinned_output() {
     let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "sk-ant-direct")]);
     assert!(status.success(), "render failed: {stderr}");
     let actual = hex::encode(Sha256::digest(rendered.as_bytes()));
     assert_eq!(actual, DIRECT_TESTNET_SHA256);
     assert!(rendered.contains("exact: api.anthropic.com"));
     assert!(rendered.contains("exact: api.openai.com"));
+    assert!(rendered.contains("GM_ANTHROPIC_KEY_SLOT_1"));
+    assert!(!rendered.contains("sk-ant-direct"));
+    assert!(!rendered.contains("value: \"%ENVIRONMENT(ANTHROPIC_API_KEY)%\""));
 }
 
 #[test]
-fn explicit_direct_render_matches_pre_cloud_output_byte_for_byte() {
+fn explicit_direct_render_matches_pinned_output() {
     let (status, _, stderr, rendered) = render_envoy([
         ("ANTHROPIC_API_KEY", "sk-ant-direct"),
         ("ANTHROPIC_UPSTREAM", "direct"),
@@ -72,6 +76,51 @@ fn explicit_direct_render_matches_pre_cloud_output_byte_for_byte() {
     assert_eq!(actual, DIRECT_TESTNET_SHA256);
     assert!(rendered.contains("exact: api.anthropic.com"));
     assert!(rendered.contains("exact: api.openai.com"));
+    assert!(rendered.contains("GM_ANTHROPIC_KEY_SLOT_1"));
+    assert!(!rendered.contains("sk-ant-direct"));
+}
+
+#[test]
+fn direct_multikey_render_contains_slot_ids_not_key_values() {
+    let (status, _, stderr, rendered) =
+        render_envoy([("ANTHROPIC_API_KEY", "sk-ant-a; sk-ant-b ")]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert!(rendered.contains("GM_ANTHROPIC_KEY_SLOT_1"));
+    assert!(rendered.contains("GM_ANTHROPIC_KEY_SLOT_2"));
+    assert!(rendered.contains("slot_unavailable"));
+    assert!(!rendered.contains("sk-ant-a"));
+    assert!(!rendered.contains("sk-ant-b"));
+}
+
+#[test]
+fn no_node_secret_single_key_falls_back_to_direct_env() {
+    // Legacy/no-node-secret deployments cannot derive slot ids; a single
+    // direct key must keep rendering via the pre-slot direct env fallback.
+    let (status, _, stderr, rendered) = render_envoy([
+        ("GM_NODE_SECRET", ""),
+        ("ANTHROPIC_API_KEY", "sk-ant-legacy"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert!(!rendered.contains("GM_ANTHROPIC_KEY_SLOT_1"));
+    assert!(rendered.contains("exact: api.anthropic.com"));
+    assert!(!rendered.contains("sk-ant-legacy"));
+}
+
+#[test]
+fn no_node_secret_multikey_fails_fast() {
+    let (status, _, stderr, _) = render_envoy([
+        ("GM_NODE_SECRET", ""),
+        ("ANTHROPIC_API_KEY", "sk-ant-a;sk-ant-b"),
+    ]);
+    assert!(
+        !status.success(),
+        "multi-key without a node secret must fail"
+    );
+    assert!(
+        stderr.contains("GM_NODE_SECRET is unset"),
+        "actionable error expected, got: {stderr}"
+    );
+    assert!(!stderr.contains("sk-ant-a"), "no key material in errors");
 }
 
 #[test]
@@ -141,6 +190,28 @@ fn azure_render_uses_suffix_san_for_each_allowed_endpoint_suffix() {
         assert!(rendered.contains(&format!("suffix: {suffix}")));
         assert!(!rendered.contains(&format!("exact: {host}")));
     }
+}
+
+#[test]
+fn direct_empty_slot_fails_fast_without_printing_key_material() {
+    let (status, _, stderr, _) = render_envoy([("OPENAI_API_KEY", "sk-a;;sk-b")]);
+    assert!(!status.success(), "empty direct slot should fail");
+    assert!(stderr.contains("empty slot"), "unexpected stderr: {stderr}");
+    assert!(!stderr.contains("sk-a"));
+    assert!(!stderr.contains("sk-b"));
+}
+
+#[test]
+fn cloud_backend_multikey_fails_fast() {
+    let (status, _, stderr, _) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "bedrock"),
+        ("BEDROCK_REGION", "us-west-2"),
+        ("BEDROCK_API_KEY", "bedrock-a;bedrock-b"),
+    ]);
+    assert!(!status.success(), "cloud backend multikey should fail");
+    assert!(stderr.contains("BEDROCK_API_KEY cannot contain ';'"));
+    assert!(!stderr.contains("bedrock-a"));
+    assert!(!stderr.contains("bedrock-b"));
 }
 
 #[test]
