@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # gm miner container entrypoint.
 #
-# Startup runs one one-shot provisioning step, then launches two
-# co-located long-running processes:
+# Startup runs the required one-shot gates, then launches two co-located
+# long-running processes:
 #
-#   0. gm-miner-ratls (one-shot) — mints the data-plane RA-TLS
+#   0. gm-miner-attestd --verify-azure-once (one-shot, Azure only) —
+#      verifies the configured Azure OpenAI account owner-capture
+#      controls before Envoy can serve Azure traffic. A failure aborts
+#      the container.
+#   1. gm-miner-ratls (one-shot) — mints the data-plane RA-TLS
 #      certificate via dstack's GetTlsKey RPC and writes the key/cert
 #      PEM files envoy's :8080 DownstreamTlsContext references. Runs to
 #      completion before envoy starts; a failure aborts the container.
-#   1. gm-miner-attestd — serves GET /attestation/info with a fresh
+#   2. gm-miner-attestd — serves GET /attestation/info with a fresh
 #      Intel TDX quote from the dstack guest agent. Bound to loopback;
 #      envoy routes the single /attestation/info path to it.
-#   2. envoy — the data plane on :8080. Terminates RA-TLS with the
+#   3. envoy — the data plane on :8080. Terminates RA-TLS with the
 #      minted certificate, proxies provider inference traffic and the
 #      registry's x-gm-provider capability probes, and forwards
 #      /attestation/info to the attestation server.
@@ -173,6 +177,10 @@ parse_azure_host() {
       log "error: AZURE_OPENAI_ENDPOINT has unsupported URL scheme"
       exit 1
       ;;
+    *)
+      log "error: AZURE_OPENAI_ENDPOINT must use https"
+      exit 1
+      ;;
   esac
   rest="${rest%%/*}"
   rest="${rest%%\?*}"
@@ -249,6 +257,7 @@ OPENAI_AUTH_HEADER=authorization
 OPENAI_AUTH_VALUE="Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
 OPENAI_SAN_MATCH=exact
 OPENAI_SAN_VALUE="${OPENAI_HOST}"
+OPENAI_AZURE_TLS=0
 OPENAI_STATIC_AUTH=0
 OPENAI_CLOUD=0
 
@@ -273,13 +282,13 @@ case "${OPENAI_UPSTREAM}" in
       openai.azure.com \
       services.ai.azure.com \
       cognitiveservices.azure.com
+    AZURE_OPENAI_SUFFIX="$(matched_host_suffix "${OPENAI_HOST}" \
+      openai.azure.com \
+      services.ai.azure.com \
+      cognitiveservices.azure.com)"
     OPENAI_SAN_MATCH=suffix
-    OPENAI_SAN_VALUE=".$(
-      matched_host_suffix "${OPENAI_HOST}" \
-        openai.azure.com \
-        services.ai.azure.com \
-        cognitiveservices.azure.com
-    )"
+    OPENAI_SAN_VALUE=".${AZURE_OPENAI_SUFFIX}"
+    OPENAI_AZURE_TLS=1
     OPENAI_PATH_REWRITE=1
     OPENAI_AUTH_HEADER=api-key
     OPENAI_AUTH_VALUE="%ENVIRONMENT(AZURE_OPENAI_API_KEY)%"
@@ -402,6 +411,17 @@ else
   BENCHMARK_PORT="${benchmark_default_port}"
 fi
 
+# ── Gate Azure data-plane startup ─────────────────────────────────────
+# Render-only mode is an offline config check and never starts Envoy. On
+# real Azure startup, fail closed before rendering/provisioning/launching
+# any serving process: a failed owner-capture check must restart the
+# container rather than allowing Envoy to proxy Azure traffic.
+if [[ "${OPENAI_UPSTREAM}" == "azure" && "${GM_START_RENDER_ONLY:-}" != "1" ]]; then
+  log "verifying Azure OpenAI owner-capture controls before starting data plane"
+  gm-miner-attestd --verify-azure-once
+  log "Azure OpenAI owner-capture verification passed"
+fi
+
 # ── Render the envoy config ───────────────────────────────────────────
 # Literal token replaces (awk index/substr, not gsub) so values with
 # regex- or replacement-special characters are handled verbatim. The
@@ -450,6 +470,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_CHUTES_DEFAULT_SLOT_ENV="${GM_CHUTES_DEFAULT_SLOT_ENV}" \
   GM_OPENAI_SAN_MATCH="${OPENAI_SAN_MATCH}" \
   GM_OPENAI_SAN_VALUE="${OPENAI_SAN_VALUE}" \
+  GM_OPENAI_AZURE_TLS="${OPENAI_AZURE_TLS}" \
   awk '
   function subst(line, token, value,    out, rest, pos) {
     out = ""
@@ -492,6 +513,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     chutes_default_slot_env = ENVIRON["GM_CHUTES_DEFAULT_SLOT_ENV"]
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
+    openai_azure_tls = (ENVIRON["GM_OPENAI_AZURE_TLS"] == "1")
   }
   /^[[:space:]]*## gm:benchmark-tls-begin[[:space:]]*$/ { in_tls = 1; next }
   /^[[:space:]]*## gm:benchmark-tls-end[[:space:]]*$/   { in_tls = 0; next }
@@ -505,6 +527,12 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   /^[[:space:]]*## gm:openai-path-rewrite-begin[[:space:]]*$/ { in_openai_path_rewrite = 1; next }
   /^[[:space:]]*## gm:openai-path-rewrite-end[[:space:]]*$/   { in_openai_path_rewrite = 0; next }
   in_openai_path_rewrite && !openai_path_rewrite { next }
+  /^[[:space:]]*## gm:openai-system-tls-begin[[:space:]]*$/ { in_openai_system_tls = 1; next }
+  /^[[:space:]]*## gm:openai-system-tls-end[[:space:]]*$/   { in_openai_system_tls = 0; next }
+  in_openai_system_tls && openai_azure_tls { next }
+  /^[[:space:]]*## gm:openai-azure-tls-begin[[:space:]]*$/ { in_openai_azure_tls = 1; next }
+  /^[[:space:]]*## gm:openai-azure-tls-end[[:space:]]*$/   { in_openai_azure_tls = 0; next }
+  in_openai_azure_tls && !openai_azure_tls { next }
   /^[[:space:]]*## gm:openai-static-auth-begin[[:space:]]*$/ { in_openai_static_auth = 1; next }
   /^[[:space:]]*## gm:openai-static-auth-end[[:space:]]*$/   { in_openai_static_auth = 0; next }
   in_openai_static_auth && !openai_static_auth { next }

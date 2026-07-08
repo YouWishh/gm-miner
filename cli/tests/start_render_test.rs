@@ -150,11 +150,46 @@ fn bedrock_and_azure_render_cloud_upstreams() {
 
     assert!(rendered.contains("host_rewrite_literal: gm-resource.openai.azure.com"));
     assert!(rendered.contains("address: gm-resource.openai.azure.com"));
+    assert!(rendered.contains("sni: gm-resource.openai.azure.com"));
+    assert!(rendered.contains("filename: /etc/ssl/certs/ca-certificates.crt"));
     assert!(rendered.contains("suffix: .openai.azure.com"));
     assert!(!rendered.contains("exact: gm-resource.openai.azure.com"));
     assert!(rendered.contains("substitution: \"/openai/v1/chat/completions\""));
     assert!(rendered.contains("key: api-key"));
     assert!(rendered.contains("value: \"%ENVIRONMENT(AZURE_OPENAI_API_KEY)%\""));
+}
+
+#[test]
+fn azure_render_uses_suffix_san_for_each_allowed_endpoint_suffix() {
+    for (endpoint, host, suffix) in [
+        (
+            "https://gm-resource.openai.azure.com/",
+            "gm-resource.openai.azure.com",
+            ".openai.azure.com",
+        ),
+        (
+            "https://gm-resource.services.ai.azure.com/",
+            "gm-resource.services.ai.azure.com",
+            ".services.ai.azure.com",
+        ),
+        (
+            "https://gm-resource.cognitiveservices.azure.com/openai",
+            "gm-resource.cognitiveservices.azure.com",
+            ".cognitiveservices.azure.com",
+        ),
+    ] {
+        let (status, _, stderr, rendered) = render_envoy([
+            ("OPENAI_UPSTREAM", "azure"),
+            ("AZURE_OPENAI_ENDPOINT", endpoint),
+            ("AZURE_OPENAI_API_KEY", "azure-key"),
+        ]);
+        assert!(status.success(), "render failed for {endpoint}: {stderr}");
+
+        assert!(rendered.contains(&format!("address: {host}")));
+        assert!(rendered.contains(&format!("sni: {host}")));
+        assert!(rendered.contains(&format!("suffix: {suffix}")));
+        assert!(!rendered.contains(&format!("exact: {host}")));
+    }
 }
 
 #[test]

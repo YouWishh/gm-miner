@@ -24,16 +24,19 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::routing::get;
 use axum::Router;
+use gm_miner_attestd::azure_verify;
 use gm_miner_attestd::info::AppState;
 use gm_miner_attestd::{
     attestation_info, validate_miner_id, DstackAttestationProvider, SigningKeypair,
 };
+use tokio::sync::oneshot;
 
 /// Default identity slug when `GM_MINER_ID` is unset.
 const DEFAULT_MINER_ID: &str = "gm-miner";
 /// Default bind address. Loopback only — Envoy reaches it in-container;
 /// nothing external should hit the attestation server directly.
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8081";
+const VERIFY_AZURE_ONCE_ARG: &str = "--verify-azure-once";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,6 +51,18 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args == [VERIFY_AZURE_ONCE_ARG] {
+        tracing::info!("running one-shot Azure OpenAI owner-capture verification");
+        azure_verify::verify_azure_openai_config_from_env()
+            .await
+            .context("Azure OpenAI owner-capture verification failed")?;
+        return Ok(());
+    }
+    if !args.is_empty() {
+        anyhow::bail!("unknown argument(s): {}", args.join(" "));
+    }
 
     let miner_id = std::env::var("GM_MINER_ID").unwrap_or_else(|_| DEFAULT_MINER_ID.to_owned());
     validate_miner_id(&miner_id).map_err(|e| anyhow::anyhow!(e))?;
@@ -82,6 +97,15 @@ async fn main() -> Result<()> {
             .context("bootstrap dstack attestation provider")?,
     );
 
+    let azure_upstream =
+        std::env::var("OPENAI_UPSTREAM").unwrap_or_else(|_| "direct".to_owned()) == "azure";
+    if azure_upstream {
+        tracing::info!("verifying Azure OpenAI owner-capture controls");
+        if let Err(err) = azure_verify::verify_azure_openai_config_from_env().await {
+            anyhow::bail!("Azure OpenAI owner-capture verification failed: {err:#}");
+        }
+    }
+
     let app = Router::new()
         .route("/attestation/info", get(attestation_info))
         .with_state(provider);
@@ -90,6 +114,35 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind attestation server to {bind_addr}"))?;
     tracing::info!(bind_addr = %bind_addr, "miner attestation server listening");
+
+    let (_periodic_azure_verify_task, azure_shutdown_rx) = if azure_upstream {
+        let (fatal_shutdown_tx, fatal_shutdown_rx) = oneshot::channel();
+        let task =
+            azure_verify::spawn_periodic_azure_openai_verification_from_env(fatal_shutdown_tx)
+                .context("start periodic Azure OpenAI owner-capture verification")?;
+        (Some(task), Some(fatal_shutdown_rx))
+    } else {
+        (None, None)
+    };
+
+    if let Some(azure_shutdown_rx) = azure_shutdown_rx {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let reason = azure_shutdown_rx.await.unwrap_or_else(|_| {
+                    "periodic Azure OpenAI owner-capture verification task ended".to_owned()
+                });
+                tracing::error!(
+                    reason = %reason,
+                    "stopping attestd after Azure OpenAI owner-capture verification failure",
+                );
+            })
+            .await
+            .context("attestation server terminated")?;
+        anyhow::bail!(
+            "attestd stopped after periodic Azure OpenAI owner-capture verification failure"
+        );
+    }
+
     axum::serve(listener, app)
         .await
         .context("attestation server terminated")?;

@@ -124,6 +124,10 @@ impl Cli {
 }
 
 #[derive(Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap command variants keep their parsed fields inline; set-api-keys carries many provider options"
+)]
 enum Command {
     /// Persist provider API keys to ~/.gmcli/config.json (mode 0600).
     ///
@@ -170,6 +174,26 @@ enum Command {
         /// Azure `OpenAI` API key for `OPENAI_UPSTREAM=azure`.
         #[arg(long)]
         azure_openai_api_key: Option<String>,
+
+        /// Azure tenant ID for ARM verification when `OPENAI_UPSTREAM=azure`.
+        #[arg(long)]
+        azure_tenant_id: Option<String>,
+
+        /// Azure subscription ID for ARM verification when `OPENAI_UPSTREAM=azure`.
+        #[arg(long)]
+        azure_subscription_id: Option<String>,
+
+        /// Azure resource group for ARM verification when `OPENAI_UPSTREAM=azure`.
+        #[arg(long)]
+        azure_resource_group: Option<String>,
+
+        /// Azure client ID for ARM verification when `OPENAI_UPSTREAM=azure`.
+        #[arg(long)]
+        azure_client_id: Option<String>,
+
+        /// Azure client secret for ARM verification when `OPENAI_UPSTREAM=azure`.
+        #[arg(long)]
+        azure_client_secret: Option<String>,
 
         /// Google API key.
         #[arg(long)]
@@ -615,6 +639,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             openai_upstream,
             azure_openai_endpoint,
             azure_openai_api_key,
+            azure_tenant_id,
+            azure_subscription_id,
+            azure_resource_group,
+            azure_client_id,
+            azure_client_secret,
             google,
             chutes,
         } => cmd_set_api_keys(
@@ -627,6 +656,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             openai_upstream,
             azure_openai_endpoint,
             azure_openai_api_key,
+            azure_tenant_id,
+            azure_subscription_id,
+            azure_resource_group,
+            azure_client_id,
+            azure_client_secret,
             google,
             chutes,
         ),

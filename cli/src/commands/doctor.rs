@@ -323,6 +323,11 @@ mod tests {
             openai_upstream: Some("azure".to_owned()),
             azure_openai_endpoint: Some("https://acct.openai.azure.com".to_owned()),
             azure_openai_api_key: Some("azure-key".to_owned()),
+            azure_tenant_id: Some("tenant".to_owned()),
+            azure_subscription_id: Some("sub".to_owned()),
+            azure_resource_group: Some("rg".to_owned()),
+            azure_client_id: Some("client".to_owned()),
+            azure_client_secret: Some("secret".to_owned()),
             ..ProviderKeys::default()
         }));
 

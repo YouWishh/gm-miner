@@ -1,0 +1,282 @@
+use anyhow::{bail, Context, Result};
+use reqwest::{Client, StatusCode};
+use serde::Deserialize;
+use serde_json::Value;
+use thiserror::Error;
+
+use super::config::AzureVerifyConfig;
+use super::endpoint::AzureEndpoint;
+
+const MANAGEMENT_SCOPE: &str = "https://management.azure.com/.default";
+const ARM_API_VERSION: &str = "2024-10-01";
+const DIAGNOSTIC_SETTINGS_API_VERSION: &str = "2021-05-01-preview";
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TokenResponse {
+    pub(crate) access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArmAccount {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) properties: ArmAccountProperties,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArmAccountProperties {
+    pub(crate) custom_sub_domain_name: Option<String>,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) rai_monitor_config: Option<Value>,
+    pub(crate) user_owned_storage: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DiagnosticSettingsList {
+    #[serde(default)]
+    pub(crate) value: Vec<DiagnosticSetting>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DiagnosticSetting {
+    #[serde(default)]
+    pub(crate) properties: DiagnosticProperties,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DiagnosticProperties {
+    #[serde(default)]
+    pub(crate) logs: Vec<DiagnosticLog>,
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) storage_account_id: Option<String>,
+    pub(crate) event_hub_authorization_rule_id: Option<String>,
+    pub(crate) marketplace_partner_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DiagnosticLog {
+    pub(crate) category: Option<String>,
+    pub(crate) category_group: Option<String>,
+    #[serde(default)]
+    pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArmDeploymentList {
+    #[serde(default)]
+    pub(crate) value: Vec<ArmDeployment>,
+    #[serde(rename = "nextLink")]
+    pub(crate) next_link: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArmDeployment {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) properties: ArmDeploymentProperties,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArmDeploymentProperties {
+    pub(crate) rai_policy_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArmRaiPolicy {
+    #[serde(default)]
+    pub(crate) properties: ArmRaiPolicyProperties,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ArmRaiPolicyProperties {
+    pub(crate) mode: Option<String>,
+}
+
+#[derive(Debug, Error)]
+#[error("{label} request failed ({status}): {body}")]
+pub(crate) struct AzureHttpStatusError {
+    pub(crate) label: &'static str,
+    pub(crate) status: StatusCode,
+    pub(crate) body: String,
+}
+
+impl DiagnosticProperties {
+    pub(crate) fn destination_count(&self) -> usize {
+        [
+            self.workspace_id.as_ref(),
+            self.storage_account_id.as_ref(),
+            self.event_hub_authorization_rule_id.as_ref(),
+            self.marketplace_partner_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .count()
+    }
+}
+
+pub(crate) async fn fetch_entra_token(
+    client: &Client,
+    config: &AzureVerifyConfig,
+) -> Result<String> {
+    let url = format!(
+        "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+        encode_path_segment(&config.tenant_id)
+    );
+    let response = client
+        .post(&url)
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", config.client_id.as_str()),
+            ("client_secret", config.client_secret.as_str()),
+            ("scope", MANAGEMENT_SCOPE),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AzureHttpStatusError {
+            label: "Entra token",
+            status,
+            body,
+        }
+        .into());
+    }
+    let token: TokenResponse = response
+        .json()
+        .await
+        .context("parse Entra token response")?;
+    if token.access_token.trim().is_empty() {
+        bail!("Entra token response had an empty access_token");
+    }
+    Ok(token.access_token)
+}
+
+pub(crate) async fn fetch_arm_account(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    token: &str,
+) -> Result<ArmAccount> {
+    let url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}?api-version={ARM_API_VERSION}",
+        encode_path_segment(&config.subscription_id),
+        encode_path_segment(&config.resource_group),
+        encode_path_segment(&endpoint.account_name),
+    );
+    get_json(client, &url, token, "Azure Cognitive Services account").await
+}
+
+pub(crate) async fn fetch_diagnostic_settings(
+    client: &Client,
+    resource_id: &str,
+    token: &str,
+) -> Result<DiagnosticSettingsList> {
+    let resource_path = resource_id
+        .strip_prefix('/')
+        .with_context(|| format!("ARM resource id must start with '/': {resource_id}"))?;
+    let url = format!(
+        "https://management.azure.com/{resource_path}/providers/Microsoft.Insights/diagnosticSettings?api-version={DIAGNOSTIC_SETTINGS_API_VERSION}",
+    );
+    get_json(client, &url, token, "Azure diagnostic settings").await
+}
+
+pub(crate) async fn fetch_arm_deployments(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    token: &str,
+) -> Result<ArmDeploymentList> {
+    let mut url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/deployments?api-version={ARM_API_VERSION}",
+        encode_path_segment(&config.subscription_id),
+        encode_path_segment(&config.resource_group),
+        encode_path_segment(&endpoint.account_name),
+    );
+    let mut deployments = Vec::new();
+    loop {
+        let page: ArmDeploymentList =
+            get_json(client, &url, token, "Azure OpenAI deployments").await?;
+        deployments.extend(page.value);
+        let Some(next_link) = page.next_link else {
+            break;
+        };
+        if next_link.trim().is_empty() {
+            bail!("Azure OpenAI deployments response had an empty nextLink");
+        }
+        url = next_link;
+    }
+    Ok(ArmDeploymentList {
+        value: deployments,
+        next_link: None,
+    })
+}
+
+pub(crate) async fn fetch_arm_rai_policy(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    policy_name: &str,
+    token: &str,
+) -> Result<ArmRaiPolicy> {
+    let url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/raiPolicies/{}?api-version={ARM_API_VERSION}",
+        encode_path_segment(&config.subscription_id),
+        encode_path_segment(&config.resource_group),
+        encode_path_segment(&endpoint.account_name),
+        encode_path_segment(policy_name),
+    );
+    get_json(client, &url, token, "Azure OpenAI RAI policy").await
+}
+
+pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(
+    client: &Client,
+    url: &str,
+    token: &str,
+    label: &'static str,
+) -> Result<T> {
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AzureHttpStatusError {
+            label,
+            status,
+            body,
+        }
+        .into());
+    }
+    response
+        .json()
+        .await
+        .with_context(|| format!("parse {label} response"))
+}
+
+pub(crate) fn encode_path_segment(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    encoded
+}
