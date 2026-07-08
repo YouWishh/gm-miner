@@ -765,25 +765,26 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
           sni: __GM_OPENAI_HOST__
           common_tls_context:
+            ## gm:openai-system-tls-begin
             validation_context:
-              ## gm:openai-system-tls-begin
               trusted_ca:
                 filename: /etc/ssl/certs/ca-certificates.crt
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
                     __GM_OPENAI_SAN_MATCH__: __GM_OPENAI_SAN_VALUE__
-              ## gm:openai-system-tls-end
-              ## gm:openai-azure-tls-begin
+            ## gm:openai-system-tls-end
+            ## gm:openai-azure-tls-begin
+            validation_context:
               trusted_ca:
-                filename: /etc/gm/azure-roots.pem
-              # Azure serves wildcard DNS SANs. Match the configured Azure suffix here;
-              # exact SNI, pinned Azure roots, and attestd ARM binding keep resource scope.
+                filename: /etc/ssl/certs/ca-certificates.crt
+              # Azure serves wildcard DNS SANs. Match the configured Azure suffix;
+              # attestd ARM binding and exact SAN pin keep resource scope.
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
                     __GM_OPENAI_SAN_MATCH__: __GM_OPENAI_SAN_VALUE__
-              ## gm:openai-azure-tls-end
+            ## gm:openai-azure-tls-end
 
     ## ── Chutes ────────────────────────────────────────────────────────
     - name: chutes

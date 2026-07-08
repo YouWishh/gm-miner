@@ -28,7 +28,7 @@ Diagnostic settings are checked as defense in depth. Enabled native metadata cat
 
 After the startup gate passes and the listener binds, `attestd` re-runs the same Azure owner-capture verification periodically, including the deployment streaming-mode check. The default interval is 900 seconds and can be overridden with `GM_AZURE_VERIFY_INTERVAL_SECS`; values below 60 seconds are clamped to 60 seconds. Transient verification errors such as Azure management/login network errors, timeouts, HTTP 408/429/5xx responses, or response decode failures are tolerated for 3 consecutive checks by default (`GM_AZURE_VERIFY_TRANSIENT_FAILURE_LIMIT`). A definitive verification failure, such as `raiMonitorConfig` becoming non-null, endpoint binding changing, account kind changing, async filtering being disabled, or other policy mismatch, stops `attestd` immediately with a non-zero exit so the container restarts and the boot-time gate blocks serving.
 
-Envoy also pins Azure upstream TLS to the baked Azure root bundle and exact DNS SAN for the configured Azure host. Direct `api.openai.com` keeps the system CA bundle and existing behavior.
+Envoy validates the Azure upstream against the system CA bundle with an exact DNS SAN pin for the configured host. Root pinning was dropped because it is out of scope for the operator threat model — a miner operator cannot obtain a valid cert for a Microsoft-owned hostname regardless of the trusted-root set — and a pinned bundle would fail closed if Microsoft rotates its Azure PKI. Direct `api.openai.com` uses the same system CA bundle and SAN pin approach.
 
 ## Required miner configuration
 
@@ -46,17 +46,6 @@ Azure miners must provide:
 The Entra app/service principal should have `Reader` scoped to the Azure OpenAI resource so `attestd` can read the account and diagnostic settings without broader permissions.
 
 Azure deployments must use a content-filter RAI policy configured for asynchronous filtering. In ARM, this is the RAI policy `mode`, not a deployment-level `contentFilters` field. The deployment's `properties.raiPolicyName` must point to a policy whose `properties.mode` is `Asynchronous_filter` or `Deferred`; the default synchronous modes buffer completions under `stream:true` and are not allowed for gm Azure miners.
-
-## Baked CA bundle
-
-Added `image/azure-roots.pem`, copied into the image at `/etc/gm/azure-roots.pem`.
-
-The bundle contains:
-
-- DigiCert Global Root G2, thumbprint `DF3C24F9BFD666761B268073FE06D1CC8D4F82A4`.
-- Microsoft RSA Root Certificate Authority 2017.
-
-DigiCert Global Root G1 is intentionally excluded because it is distrusted 2026-04-15. TODO: verify the exact PEM bytes at build time.
 
 ## Residual gaps
 
