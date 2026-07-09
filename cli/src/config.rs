@@ -351,6 +351,8 @@ pub struct ProviderKeys {
     pub google: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chutes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zai: Option<String>,
 }
 
 /// True when `v` holds a non-empty, non-whitespace value. `Some("")` and
@@ -459,6 +461,7 @@ impl ProviderKeys {
                 || (openai_upstream == "azure" && non_empty(self.azure_openai_api_key.as_deref())))
             || non_empty(self.google.as_deref())
             || non_empty(self.chutes.as_deref())
+            || non_empty(self.zai.as_deref())
     }
 
     /// Reject a selected cloud upstream that is missing fields `start.sh`

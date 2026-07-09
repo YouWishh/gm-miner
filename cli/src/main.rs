@@ -138,6 +138,7 @@ enum Command {
         gmcli set-api-keys --anthropic sk-ant-...\n  \
         gmcli set-api-keys --openai sk-... --google AIza...\n  \
         gmcli set-api-keys --chutes cpk-...\n  \
+        gmcli set-api-keys --zai zai-...\n  \
         gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-west-2 \\\n  \
           --bedrock-api-key brk-...\n  \
         gmcli set-api-keys --openai-upstream azure --azure-openai-endpoint https://my-resource.openai.azure.com \\\n  \
@@ -202,6 +203,10 @@ enum Command {
         /// Chutes API key (cpk_...).
         #[arg(long)]
         chutes: Option<String>,
+
+        /// Z.ai API key.
+        #[arg(long)]
+        zai: Option<String>,
     },
 
     /// Deploy the miner to Phala Cloud with trust-correct hash verification.
@@ -273,7 +278,7 @@ enum Command {
     /// Render upstream key slot exports for the container entrypoint.
     #[command(hide = true)]
     SlotEnv {
-        /// Provider id: anthropic, openai, gemini, or chutes.
+        /// Provider id: anthropic, openai, gemini, chutes, or zai.
         #[arg(long)]
         provider: Provider,
 
@@ -352,7 +357,7 @@ enum Command {
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 --upstream-model us.anthropic.claude-sonnet-4-6-v1\n  \
         gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5")]
     DeclareProduct {
-        /// Provider: anthropic, openai, gemini, or chutes.
+        /// Provider: anthropic, openai, gemini, chutes, or zai.
         #[arg(long)]
         provider: Provider,
 
@@ -646,6 +651,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             azure_client_secret,
             google,
             chutes,
+            zai,
         } => cmd_set_api_keys(
             explicit_network,
             anthropic,
@@ -663,6 +669,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             azure_client_secret,
             google,
             chutes,
+            zai,
         ),
         Command::Init { yes } => cmd_init(explicit_network, api_url, yes).await,
         Command::Gm => {

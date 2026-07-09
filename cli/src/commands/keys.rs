@@ -48,6 +48,7 @@ pub(crate) fn cmd_set_api_keys(
     azure_client_secret: Option<String>,
     google: Option<String>,
     chutes: Option<String>,
+    zai: Option<String>,
 ) -> Result<()> {
     // Reject empty values up front so they don't pass the deploy preflight.
     if let Some(ref k) = anthropic {
@@ -95,11 +96,14 @@ pub(crate) fn cmd_set_api_keys(
     if let Some(ref k) = chutes {
         validate_key("chutes", k)?;
     }
+    if let Some(ref k) = zai {
+        validate_key("zai", k)?;
+    }
 
     // Load → mutate → save under the lock so a concurrent `deploy` save can't
     // be clobbered, and re-read fresh inside the lock so we merge onto the
     // latest on-disk state rather than a snapshot taken before the lock.
-    let (has_anthropic, has_bedrock, has_openai, has_azure, has_google, has_chutes) =
+    let (has_anthropic, has_bedrock, has_openai, has_azure, has_google, has_chutes, has_zai) =
         config::with_config_lock(|| {
             let mut cfg = config::load()
                 .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
@@ -157,6 +161,9 @@ pub(crate) fn cmd_set_api_keys(
             if let Some(k) = chutes {
                 keys.chutes = Some(k);
             }
+            if let Some(k) = zai {
+                keys.zai = Some(k);
+            }
             let snapshot = (
                 keys.anthropic.is_some(),
                 keys.bedrock_api_key.is_some(),
@@ -170,6 +177,7 @@ pub(crate) fn cmd_set_api_keys(
                     || keys.azure_client_secret.is_some(),
                 keys.google.is_some(),
                 keys.chutes.is_some(),
+                keys.zai.is_some(),
             );
 
             config::save(&cfg).context("save config")?;
@@ -195,11 +203,14 @@ pub(crate) fn cmd_set_api_keys(
     if has_chutes {
         set_names.push("chutes");
     }
+    if has_zai {
+        set_names.push("zai");
+    }
 
     // Report which providers are now configured — never print the values.
     if set_names.is_empty() {
         println!(
-            "No keys stored (pass --anthropic, --openai, --google, --chutes, \
+            "No keys stored (pass --anthropic, --openai, --google, --chutes, --zai, \
              --bedrock-api-key, or --azure-openai-api-key to set one)."
         );
     } else {

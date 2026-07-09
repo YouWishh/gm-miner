@@ -133,6 +133,13 @@ fn provider_benchmark_deserialises_but_cli_rejects_it() {
 }
 
 #[test]
+fn provider_from_str_accepts_zai() {
+    let provider = Provider::from_str("zai").unwrap();
+    assert_eq!(provider, Provider::Zai);
+    assert_eq!(provider.as_str(), "zai");
+}
+
+#[test]
 fn product_catalog_response_parses_wrapper_shape() {
     // GET /products returns ProductCatalogResponse, NOT a bare array —
     // matches the new OpenAPI schema (registry/openapi.json post-PR-C).

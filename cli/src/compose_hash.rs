@@ -61,11 +61,11 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// which keys an individual miner has configured. Hash covers names only,
 /// not values, so every miner produces the same `compose_hash`. The order
 /// matches `render_env_file`: Anthropic direct/Bedrock, `OpenAI` direct/Azure,
-/// Google, Chutes, node secret. Private-registry pull credentials
+/// Google, Chutes, Z.ai, node secret. Private-registry pull credentials
 /// (`DSTACK_DOCKER_*`) are
 /// excluded: the gm image is public and those vars do not appear in
 /// `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 16] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 17] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
@@ -81,6 +81,7 @@ const CANONICAL_ALLOWED_ENVS: [&str; 16] = [
     "AZURE_CLIENT_SECRET",
     "GOOGLE_API_KEY",
     "CHUTES_API_KEY",
+    "ZAI_API_KEY",
     "GM_NODE_SECRET",
 ];
 
@@ -218,7 +219,7 @@ mod tests {
     /// version: bump it in lockstep with `TESTNET_IMAGE_REF` whenever a new
     /// `ImageVersion` is published, then confirm live miners attest to it.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "98307c5bd24dd12d333dc1de2a4bf76aff25d4eb5a36e82c3c49df5ba8e760cc";
+        "860c331f0fb85623edce97cc227e9df5af731dbeb6a3418a43e65775d31e3f1b";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {

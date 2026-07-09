@@ -216,6 +216,9 @@ fn configured_providers(keys: Option<&ProviderKeys>) -> Result<Vec<Provider>> {
     if non_empty(keys.chutes.as_deref()) {
         providers.push(Provider::Chutes);
     }
+    if non_empty(keys.zai.as_deref()) {
+        providers.push(Provider::Zai);
+    }
     Ok(providers)
 }
 
@@ -334,6 +337,7 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::OpenAI => "gpt-5.5",
         Provider::Gemini => "gemini-2.5-pro",
         Provider::Chutes => "deepseek-ai/DeepSeek-V3-0324",
+        Provider::Zai => "glm-5.2",
         Provider::Benchmark => "benchmark",
     }
 }
@@ -354,7 +358,7 @@ fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
         Provider::Gemini => {
             openai_compatible_probe(provider, model, "/v1beta/openai/chat/completions")
         }
-        Provider::OpenAI | Provider::Chutes => {
+        Provider::OpenAI | Provider::Chutes | Provider::Zai => {
             openai_compatible_probe(provider, model, "/v1/chat/completions")
         }
         Provider::Benchmark => openai_compatible_probe(provider, model, "/v1/chat/completions"),
@@ -688,6 +692,18 @@ mod tests {
         let probe = build_probe(Provider::OpenAI, &model);
         assert_eq!(probe.body["model"], Value::String("gpt-5.5".to_owned()));
         assert_eq!(probe.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn zai_probe_uses_openai_compatible_route_and_model() {
+        let model = ProbeModel {
+            canonical: fallback_model(&Provider::Zai).to_owned(),
+            upstream: None,
+        };
+        let probe = build_probe(Provider::Zai, &model);
+        assert_eq!(probe.path, "/v1/chat/completions");
+        assert_eq!(probe.body["model"], Value::String("glm-5.2".to_owned()));
+        assert_eq!(probe.model, "glm-5.2");
     }
 
     #[test]
