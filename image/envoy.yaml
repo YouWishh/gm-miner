@@ -405,6 +405,31 @@ static_resources:
                             - x-gm-provider
                             - x-gm-upstream-slot
 
+                        ## ── Z.ai ────────────────────────────────────────────
+                        ##  Enabled only when ZAI_API_KEY is set.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "zai"
+                          route:
+                            cluster: zai
+                            host_rewrite_literal: api.z.ai
+                            regex_rewrite:
+                              pattern:
+                                google_re2: {}
+                                regex: "^/v1/(.*)$"
+                              substitution: "/api/paas/v4/\\1"
+                            timeout: 620s
+                          request_headers_to_remove:
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                            - x-gm-upstream-slot
+
                         ## ── Gemini ──────────────────────────────────────────
                         ##  Enabled only when GOOGLE_API_KEY is set.
                         - match:
@@ -518,6 +543,12 @@ static_resources:
                               default_env = __GM_CHUTES_DEFAULT_SLOT_ENV__,
                               slots = __GM_CHUTES_SLOT_MAP__,
                             },
+                            zai = {
+                              cloud = false,
+                              direct_env = "ZAI_API_KEY",
+                              default_env = __GM_ZAI_DEFAULT_SLOT_ENV__,
+                              slots = __GM_ZAI_SLOT_MAP__,
+                            },
                           }
 
                           local function json_escape(value)
@@ -568,6 +599,8 @@ static_resources:
                             elseif provider == "gemini" then
                               headers:add("x-goog-api-key", key)
                             elseif provider == "chutes" then
+                              headers:add("authorization", "Bearer " .. key)
+                            elseif provider == "zai" then
                               headers:add("authorization", "Bearer " .. key)
                             end
                           end
@@ -959,6 +992,39 @@ static_resources:
                 - san_type: DNS
                   matcher:
                     exact: llm.chutes.ai
+
+    ## ── Z.ai ───────────────────────────────────────────────────────────
+    - name: zai
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: zai
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: api.z.ai
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: api.z.ai
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: api.z.ai
 
     ## ── Gemini ────────────────────────────────────────────────────────
     - name: gemini

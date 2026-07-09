@@ -124,7 +124,7 @@ pub fn provider_slots_for_keys(
         // v1: a cloud-backend worker is single-slot for EVERY provider —
         // the registry rejects slot claims from backend workers and its
         // control loop never probes them. Advertising slots for the
-        // direct providers (gemini, chutes, the non-backend of
+        // direct providers (gemini, chutes, zai, the non-backend of
         // anthropic/openai) would 422 the registration after the CVM has
         // already launched, and multi-key values there would sit silently
         // unused, so both are refused up front.
@@ -146,6 +146,7 @@ pub fn provider_slots_for_keys(
     }
     add_provider_slots(&mut slots, "gemini", keys.google.as_deref(), node_secret)?;
     add_provider_slots(&mut slots, "chutes", keys.chutes.as_deref(), node_secret)?;
+    add_provider_slots(&mut slots, "zai", keys.zai.as_deref(), node_secret)?;
     Ok(slots)
 }
 
@@ -214,7 +215,7 @@ pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
 /// The direct-provider key env vars the deployed image would actually
 /// read: keys sidelined by a cloud upstream selector are excluded, so a
 /// stale semicolon value there never blocks a deploy.
-fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 4] {
+fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 5] {
     let anthropic_direct = keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
     let openai_direct = keys.openai_upstream.as_deref().unwrap_or("direct") == "direct";
     [
@@ -228,6 +229,7 @@ fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 4] 
         ),
         ("GOOGLE_API_KEY", keys.google.as_deref()),
         ("CHUTES_API_KEY", keys.chutes.as_deref()),
+        ("ZAI_API_KEY", keys.zai.as_deref()),
     ]
 }
 
@@ -381,6 +383,8 @@ mod tests {
     fn eight_segments_are_allowed() {
         let slots = parse_key_slots("chutes", "a;b;c;d;e;f;g;h", SECRET).expect("parse");
         assert_eq!(slots.len(), 8);
+        let slots = parse_key_slots("zai", "a;b;c;d;e;f;g;h", SECRET).expect("parse");
+        assert_eq!(slots.len(), 8);
     }
 
     #[test]
@@ -388,15 +392,17 @@ mod tests {
         let keys = ProviderKeys {
             anthropic: Some("sk-ant-a;sk-ant-b".to_owned()),
             google: Some("AIza".to_owned()),
+            zai: Some("zai-key".to_owned()),
             ..ProviderKeys::default()
         };
         let slots = provider_slots_for_keys(&keys, SECRET).expect("slots");
         assert_eq!(
             slots.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["anthropic", "gemini"]
+            vec!["anthropic", "gemini", "zai"]
         );
         assert_eq!(slots["anthropic"].len(), 2);
         assert_eq!(slots["gemini"].len(), 1);
+        assert_eq!(slots["zai"].len(), 1);
         assert!(!slots.contains_key("openai"));
     }
 

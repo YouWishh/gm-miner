@@ -78,6 +78,7 @@ pub fn render_env_file(
         ),
         ("GOOGLE_API_KEY", env_vars.google.as_deref()),
         ("CHUTES_API_KEY", env_vars.chutes.as_deref()),
+        ("ZAI_API_KEY", env_vars.zai.as_deref()),
     ] {
         lines.push_str(name);
         lines.push('=');
@@ -289,7 +290,7 @@ mod tests {
 
     /// Configured keys carry their value; unset keys are still emitted as
     /// bare `NAME=` lines. The `phala` CLI reads every non-blank line's key
-    /// into the CVM's measured `allowed_envs`, so writing all four provider
+    /// into the CVM's measured `allowed_envs`, so writing every provider
     /// names unconditionally fixes the canonical set regardless of which
     /// keys the miner set — the invariant that makes every miner produce the
     /// same `compose_hash`.
@@ -300,11 +301,13 @@ mod tests {
             openai: None,
             google: None,
             chutes: Some("cpk-chutes".to_owned()),
+            zai: Some("zai-key".to_owned()),
             ..ProviderKeys::default()
         };
         let body = render_env_file(&keys, "node-secret-xyz", None);
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
         assert!(body.contains("CHUTES_API_KEY=cpk-chutes\n"));
+        assert!(body.contains("ZAI_API_KEY=zai-key\n"));
         assert!(body.contains("GM_NODE_SECRET=node-secret-xyz\n"));
         // Unset keys are emitted as empty-value lines so their names still
         // land in the CVM's measured allowed_envs.
@@ -371,6 +374,7 @@ mod tests {
                 "AZURE_CLIENT_SECRET",
                 "GOOGLE_API_KEY",
                 "CHUTES_API_KEY",
+                "ZAI_API_KEY",
                 "GM_NODE_SECRET",
             ],
             "the env file must declare every canonical name in CANONICAL_ALLOWED_ENVS order"

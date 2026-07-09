@@ -327,10 +327,14 @@ if [[ -n "${CHUTES_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "CHUTES_API_KEY set"
 fi
+if [[ -n "${ZAI_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "ZAI_API_KEY set"
+fi
 
 if [[ "${HAS_KEY}" -eq 0 ]]; then
   if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && "${OPENAI_UPSTREAM}" == "direct" ]]; then
-    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY must be set"
+    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY must be set"
   else
     log "error: at least one usable provider key must be set"
   fi
@@ -350,6 +354,9 @@ fi
 if [[ -n "${CHUTES_API_KEY:-}" ]]; then
   fan_out_slots chutes CHUTES_API_KEY
 fi
+if [[ -n "${ZAI_API_KEY:-}" ]]; then
+  fan_out_slots zai ZAI_API_KEY
+fi
 
 GM_ANTHROPIC_SLOT_MAP="$(lua_slot_map "${GM_ANTHROPIC_SLOT_IDS:-}" "GM_ANTHROPIC")"
 GM_ANTHROPIC_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_ANTHROPIC_SLOT_IDS:-}" "GM_ANTHROPIC")"
@@ -359,6 +366,8 @@ GM_GEMINI_SLOT_MAP="$(lua_slot_map "${GM_GEMINI_SLOT_IDS:-}" "GM_GEMINI")"
 GM_GEMINI_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_GEMINI_SLOT_IDS:-}" "GM_GEMINI")"
 GM_CHUTES_SLOT_MAP="$(lua_slot_map "${GM_CHUTES_SLOT_IDS:-}" "GM_CHUTES")"
 GM_CHUTES_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_CHUTES_SLOT_IDS:-}" "GM_CHUTES")"
+GM_ZAI_SLOT_MAP="$(lua_slot_map "${GM_ZAI_SLOT_IDS:-}" "GM_ZAI")"
+GM_ZAI_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_ZAI_SLOT_IDS:-}" "GM_ZAI")"
 
 # ── Resolve the benchmark upstream ────────────────────────────────────
 # The benchmark URL is hardcoded per network in this script, NOT taken
@@ -468,6 +477,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_GEMINI_DEFAULT_SLOT_ENV="${GM_GEMINI_DEFAULT_SLOT_ENV}" \
   GM_CHUTES_SLOT_MAP="${GM_CHUTES_SLOT_MAP}" \
   GM_CHUTES_DEFAULT_SLOT_ENV="${GM_CHUTES_DEFAULT_SLOT_ENV}" \
+  GM_ZAI_SLOT_MAP="${GM_ZAI_SLOT_MAP}" \
+  GM_ZAI_DEFAULT_SLOT_ENV="${GM_ZAI_DEFAULT_SLOT_ENV}" \
   GM_OPENAI_SAN_MATCH="${OPENAI_SAN_MATCH}" \
   GM_OPENAI_SAN_VALUE="${OPENAI_SAN_VALUE}" \
   GM_OPENAI_AZURE_TLS="${OPENAI_AZURE_TLS}" \
@@ -511,6 +522,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     gemini_default_slot_env = ENVIRON["GM_GEMINI_DEFAULT_SLOT_ENV"]
     chutes_slot_map = ENVIRON["GM_CHUTES_SLOT_MAP"]
     chutes_default_slot_env = ENVIRON["GM_CHUTES_DEFAULT_SLOT_ENV"]
+    zai_slot_map = ENVIRON["GM_ZAI_SLOT_MAP"]
+    zai_default_slot_env = ENVIRON["GM_ZAI_DEFAULT_SLOT_ENV"]
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
     openai_azure_tls = (ENVIRON["GM_OPENAI_AZURE_TLS"] == "1")
@@ -561,6 +574,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_GEMINI_DEFAULT_SLOT_ENV__", gemini_default_slot_env)
     line = subst(line, "__GM_CHUTES_SLOT_MAP__", chutes_slot_map)
     line = subst(line, "__GM_CHUTES_DEFAULT_SLOT_ENV__", chutes_default_slot_env)
+    line = subst(line, "__GM_ZAI_SLOT_MAP__", zai_slot_map)
+    line = subst(line, "__GM_ZAI_DEFAULT_SLOT_ENV__", zai_default_slot_env)
     line = subst(line, "__GM_OPENAI_SAN_MATCH__", openai_san_match)
     line = subst(line, "__GM_OPENAI_SAN_VALUE__", openai_san_value)
     print line

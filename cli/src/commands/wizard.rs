@@ -309,6 +309,7 @@ fn wizard_provider_keys(
         && keys.openai.is_none()
         && keys.google.is_none()
         && keys.chutes.is_none()
+        && keys.zai.is_none()
     {
         println!("  No keys entered — skipping. Set them later with `gmcli set-api-keys`.");
         return Ok(WizardFlow::Continue);
@@ -335,6 +336,7 @@ fn wizard_provider_keys(
             keys.azure_client_secret,
             keys.google,
             keys.chutes,
+            keys.zai,
         )
     )
 }
@@ -357,6 +359,7 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         azure_client_secret: None,
         google: prompt_line("Google API key (blank to skip):", assume_yes)?,
         chutes: prompt_line("Chutes API key (blank to skip):", assume_yes)?,
+        zai: prompt_line("Z.ai API key (blank to skip):", assume_yes)?,
     })
 }
 
@@ -387,6 +390,9 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     }
     if keys.chutes.is_some() {
         cmd.push_str(" --chutes <key>");
+    }
+    if keys.zai.is_some() {
+        cmd.push_str(" --zai <key>");
     }
     cmd
 }

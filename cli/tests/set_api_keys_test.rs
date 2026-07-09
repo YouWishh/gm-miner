@@ -22,6 +22,7 @@ fn apply_set_api_keys(
     openai: Option<&str>,
     google: Option<&str>,
     chutes: Option<&str>,
+    zai: Option<&str>,
 ) -> Config {
     let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
     if let Some(k) = anthropic {
@@ -35,6 +36,9 @@ fn apply_set_api_keys(
     }
     if let Some(k) = chutes {
         keys.chutes = Some(k.to_owned());
+    }
+    if let Some(k) = zai {
+        keys.zai = Some(k.to_owned());
     }
     cfg
 }
@@ -90,7 +94,14 @@ fn save_writes_config_at_mode_0600() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = ConfigDirGuard::new();
-    let cfg = apply_set_api_keys(Config::default(), Some("sk-ant-test"), None, None, None);
+    let cfg = apply_set_api_keys(
+        Config::default(),
+        Some("sk-ant-test"),
+        None,
+        None,
+        None,
+        None,
+    );
     gm_miner_cli::config::save(&cfg).unwrap();
 
     let written = gm_miner_cli::config::config_path();
@@ -110,6 +121,7 @@ fn save_then_load_round_trips_provider_keys() {
         Some("sk-oai-x"),
         None,
         Some("cpk-x"),
+        Some("zai-x"),
     );
     gm_miner_cli::config::save(&cfg).unwrap();
 
@@ -119,6 +131,7 @@ fn save_then_load_round_trips_provider_keys() {
     assert_eq!(keys.openai.as_deref(), Some("sk-oai-x"));
     assert_eq!(keys.google, None);
     assert_eq!(keys.chutes.as_deref(), Some("cpk-x"));
+    assert_eq!(keys.zai.as_deref(), Some("zai-x"));
 }
 
 // ── Key merge semantics ───────────────────────────────────────────────────────
@@ -126,10 +139,10 @@ fn save_then_load_round_trips_provider_keys() {
 #[test]
 fn missing_flags_preserve_existing_keys() {
     // First call: set anthropic only.
-    let cfg1 = apply_set_api_keys(Config::default(), Some("sk-ant-1"), None, None, None);
+    let cfg1 = apply_set_api_keys(Config::default(), Some("sk-ant-1"), None, None, None, None);
 
     // Second call: set openai only — anthropic must survive.
-    let cfg2 = apply_set_api_keys(cfg1, None, Some("sk-openai-1"), None, None);
+    let cfg2 = apply_set_api_keys(cfg1, None, Some("sk-openai-1"), None, None, None);
 
     let keys = cfg2.provider_keys.unwrap();
     assert_eq!(keys.anthropic.as_deref(), Some("sk-ant-1"));
@@ -139,8 +152,8 @@ fn missing_flags_preserve_existing_keys() {
 
 #[test]
 fn new_value_replaces_existing_key() {
-    let cfg1 = apply_set_api_keys(Config::default(), Some("old-key"), None, None, None);
-    let cfg2 = apply_set_api_keys(cfg1, Some("new-key"), None, None, None);
+    let cfg1 = apply_set_api_keys(Config::default(), Some("old-key"), None, None, None, None);
+    let cfg2 = apply_set_api_keys(cfg1, Some("new-key"), None, None, None, None);
     let keys = cfg2.provider_keys.unwrap();
     assert_eq!(keys.anthropic.as_deref(), Some("new-key"));
 }
@@ -153,8 +166,9 @@ fn no_flags_leaves_config_unchanged() {
         Some("sk-oai-x"),
         None,
         None,
+        None,
     );
-    let cfg2 = apply_set_api_keys(cfg1, None, None, None, None);
+    let cfg2 = apply_set_api_keys(cfg1, None, None, None, None, None);
     let keys = cfg2.provider_keys.unwrap();
     assert_eq!(keys.anthropic.as_deref(), Some("sk-ant-x"));
     assert_eq!(keys.openai.as_deref(), Some("sk-oai-x"));
@@ -168,12 +182,14 @@ fn all_providers_can_be_set() {
         Some("oai-key"),
         Some("ggl-key"),
         Some("cpk-key"),
+        Some("zai-key"),
     );
     let keys = cfg.provider_keys.unwrap();
     assert_eq!(keys.anthropic.as_deref(), Some("ant-key"));
     assert_eq!(keys.openai.as_deref(), Some("oai-key"));
     assert_eq!(keys.google.as_deref(), Some("ggl-key"));
     assert_eq!(keys.chutes.as_deref(), Some("cpk-key"));
+    assert_eq!(keys.zai.as_deref(), Some("zai-key"));
 }
 
 // ── Key values not echoed ─────────────────────────────────────────────────────
@@ -190,7 +206,7 @@ fn all_providers_can_be_set() {
 #[test]
 fn key_value_stored_but_not_displayable() {
     let secret = "super-secret-key-xyz-9999";
-    let cfg = apply_set_api_keys(Config::default(), Some(secret), None, None, None);
+    let cfg = apply_set_api_keys(Config::default(), Some(secret), None, None, None, None);
     let keys = cfg.provider_keys.unwrap();
     // Value is stored correctly.
     assert_eq!(keys.anthropic.as_deref(), Some(secret));
@@ -277,6 +293,19 @@ fn any_set_true_when_chutes_set() {
         openai: None,
         google: None,
         chutes: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(keys.any_set());
+}
+
+#[test]
+fn any_set_true_when_zai_set() {
+    let keys = ProviderKeys {
+        anthropic: None,
+        openai: None,
+        google: None,
+        chutes: None,
+        zai: Some("k".to_owned()),
         ..ProviderKeys::default()
     };
     assert!(keys.any_set());
